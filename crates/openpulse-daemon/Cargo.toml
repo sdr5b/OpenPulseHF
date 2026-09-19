@@ -93,4 +93,4 @@ openpulse-modem = { workspace = true, features = ["instruments"] }
 openpulse-audio  = { workspace = true }
 js8-plugin       = { workspace = true }
 bpsk-plugin      = { workspace = true }
-ed25519-dalek    = { version = "2.0" }
+ed25519-dalek    = { version = "3.0" }
