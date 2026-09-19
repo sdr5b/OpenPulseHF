@@ -11,7 +11,7 @@ description = "PTT controller trait and backends for OpenPulseHF (serial RTS/DTR
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1.1", default-features = false, features = ["parse"] }
 
 [target.'cfg(unix)'.dependencies]
 serialport = { version = "4.7", optional = true }
