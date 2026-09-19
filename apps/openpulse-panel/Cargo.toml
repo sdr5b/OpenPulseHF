@@ -17,4 +17,4 @@ openpulse-modem = { workspace = true }
 serde_json = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
-ewebsock = "0.6"
+ewebsock = "0.8"
