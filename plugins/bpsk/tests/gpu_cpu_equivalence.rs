@@ -184,3 +184,112 @@ fn gpu_and_cpu_agree_under_a_carrier_offset() {
         );
     }
 }
+
+/// Bit errors of `got` against `want`, over `want`'s length. `None` if the demod produced too little.
+fn bit_errors(got: Option<Vec<u8>>, want: &[u8]) -> Option<(u32, u32)> {
+    let g = got?;
+    if g.len() < want.len() {
+        return None;
+    }
+    let bad = g[..want.len()]
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a ^ b).count_ones())
+        .sum();
+    Some((bad, (want.len() * 8) as u32))
+}
+
+/// The two arms must agree **where the crossfade cancellation actually decides the frame** (#1433).
+///
+/// `gpu_and_cpu_agree_under_noise` sweeps 4…20 dB *total-power* SNR on a 27-byte payload. BPSK250 at
+/// 8 kHz is 32 samples/symbol (~15 dB of processing gain), so its lowest cell sits near 19 dB Eb/N0 —
+/// both arms decode every seed there and a BER difference cannot show up. Measured on this host, 4 dB
+/// is the *first* SNR at which the difference vanishes: 16/16 both ways. One and two dB lower it is
+/// the whole frame.
+///
+/// Pre-fix measurement (GPU not cancelling), 200 B, 16 seeds:
+///
+/// | total-power SNR | CPU BER | GPU BER | ratio | CPU ok | GPU ok |
+/// |---|---|---|---|---|---|
+/// | 0 dB | 0.00023 | 0.00328 | 14.0 | 11/16 | **0/16** |
+/// | 2 dB | 0.00000 | 0.00047 | — | 16/16 | **9/16** |
+/// | 4 dB | 0.00000 | 0.00000 | — | 16/16 | 16/16 |
+///
+/// So this asserts the mechanism (the BER ratio) *and* the outcome (decode counts), and carries its
+/// own guards against going vacuous: the cell is required to be one where the CPU both decodes some
+/// frames and makes some errors, or the ratio would be meaningless and the counts uninformative.
+#[test]
+fn gpu_and_cpu_agree_where_the_cancellation_decides_the_frame() {
+    let Some(c) = ctx() else { return };
+    let cfg = config("BPSK250", 1500.0);
+    let payload: Vec<u8> = (0..200u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let tx = bpsk_modulate(&payload, &cfg).expect("modulate");
+    let mut unsaturated_cells = 0u32;
+
+    for snr_db in [0.0f32, 2.0] {
+        let (mut cpu_bad, mut cpu_tot, mut gpu_bad, mut gpu_tot) = (0u32, 0u32, 0u32, 0u32);
+        let (mut cpu_ok, mut gpu_ok) = (0u32, 0u32);
+        let seeds = 16u64;
+        for seed in 0..seeds {
+            let rx = add_awgn(&tx, snr_db, seed * 7919 + 13);
+            let cpu = bpsk_demodulate(&rx, &cfg).ok();
+            let gpu = bpsk_demodulate_with_gpu(&rx, &cfg, &c).ok();
+            if let Some((b, t)) = bit_errors(cpu.clone(), &payload) {
+                cpu_bad += b;
+                cpu_tot += t;
+            }
+            if let Some((b, t)) = bit_errors(gpu.clone(), &payload) {
+                gpu_bad += b;
+                gpu_tot += t;
+            }
+            cpu_ok += u32::from(cpu.is_some_and(|b| b.starts_with(&payload)));
+            gpu_ok += u32::from(gpu.is_some_and(|b| b.starts_with(&payload)));
+        }
+        let cpu_ber = f64::from(cpu_bad) / f64::from(cpu_tot.max(1));
+        let gpu_ber = f64::from(gpu_bad) / f64::from(gpu_tot.max(1));
+        println!(
+            "  {snr_db:4.1} dB: cpu BER {cpu_ber:.5} ok {cpu_ok}/{seeds} | gpu BER {gpu_ber:.5} ok {gpu_ok}/{seeds}"
+        );
+
+        assert!(
+            cpu_ok > 0,
+            "{snr_db} dB is below the CPU arm's own cliff (cpu_ok = 0) — the cell cannot \
+             discriminate between the arms, so this assertion would be vacuous"
+        );
+        assert!(
+            gpu_ok + 2 >= cpu_ok,
+            "{snr_db} dB: the GPU arm decoded {gpu_ok}/{seeds} against the CPU arm's \
+             {cpu_ok}/{seeds}. The GPU demodulator is skipping cancel_crossfade_isi (#1433)"
+        );
+        if cpu_ber > 0.0 {
+            assert!(
+                gpu_ber <= cpu_ber * 2.0,
+                "{snr_db} dB: GPU BER {gpu_ber:.5} is {:.1}x the CPU's {cpu_ber:.5}. That is the \
+                 crossfade-ISI bias the CPU arm cancels and the GPU arm does not (#1433)",
+                gpu_ber / cpu_ber
+            );
+            unsaturated_cells += 1;
+        }
+    }
+
+    // GUARD BOTH SIDES OF THE CLIFF, not just the floor.
+    //
+    // `cpu_ok > 0` above rejects a cell BELOW the reference arm's cliff. Nothing rejected a cell
+    // ABOVE it — and above is the side #1433 lived on: at 2 dB the CPU column is already
+    // 0.00000 BER and 16/16, so the BER comparison is skipped by `cpu_ber > 0.0` and only the
+    // decode-count assert bites. If both cells drift above the cliff (a faster machine, a better
+    // acquisition, a re-tuned fixture) every assertion here passes on a saturated reference and
+    // this test goes quietly decorative — which is precisely how the sweep it replaced behaved.
+    //
+    // So require at least one cell where the reference arm makes REAL ERRORS, and fail loudly
+    // naming the cause when none does.
+    assert!(
+        unsaturated_cells > 0,
+        "every swept cell had a saturated CPU reference (zero bit errors), so the BER comparison \
+         never ran and this test certified agreement where agreement was guaranteed. Lower the \
+         cells until the reference arm makes errors again — the cliff moves with the mode's \
+         processing gain, not with an absolute SNR."
+    );
+}

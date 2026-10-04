@@ -20,7 +20,8 @@
 //! up to 4 acquisition windows. `ota_decode_and_ack_inner` (the coded arm, `server.rs:866`) makes
 //! ONE attempt per candidate, at offset 0, on the full burst.
 //!
-//! The demod's timing search spans a single symbol period (32 samples at BPSK250), so a frame a few
+//! The demod's timing search spans about one and a half symbol periods (`[−n/2, n)` since #1438;
+//! one period, 32 samples at BPSK250, when this was written), so a frame a few
 //! thousand samples into a burst is undecodable without a scan — and that is exactly where these
 //! frames sit. The daemon's one success is its uncoded row: the coded/uncoded split tracks SCAN
 //! PRESENCE, not chain presence.
@@ -183,7 +184,7 @@ fn via_daemon_centred(
     // candidates come from the profile. Without this the coded rows would measure "the default arm
     // cannot do RS", which is true but is NOT a fact about the acquisition chain.
     if fec != FecMode::None {
-        let profile = SessionProfile::hpx_hf();
+        let profile = SessionProfile::fast();
         // Lock the OTA level to the rung whose mode IS the captured one. `rx_candidates` offers only
         // the recommended + confirmed levels, which on a fresh session are both the ENTRY rung
         // (BPSK31) — so without this the daemon arm never tries BPSK250+Rs at all and a "no decode"

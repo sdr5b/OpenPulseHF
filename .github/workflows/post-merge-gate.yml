@@ -53,7 +53,7 @@ jobs:
     name: Workspace gate on main
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -70,13 +70,23 @@ jobs:
       # One verdict path — `scripts/gate.sh`, never an open-coded `cargo test`. Without
       # `--no-fail-fast` cargo stops at the first failing binary and the count is a lower bound
       # (CLAUDE.md verification rule 2); the script is what guarantees the flag and the `GATE:` line.
+      # `gate.sh`'s --all-features rot guard (#1380) links against ALSA, libudev and D-Bus through
+      # alsa-sys / libudev-sys / libdbus-sys, whose build scripts call pkg_config and PANIC when a
+      # .pc file is absent. The ubuntu runner image ships none of these three -dev packages, so
+      # without this step the gate fails on arrival. NOT `|| true`: a missing library here means the
+      # rot guard cannot run, and the gate's own preflight fails loudly rather than skipping it.
+      - name: Install feature-gate build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev
+
       - name: Workspace gate (fmt + clippy + tests)
         id: gate
         run: ./scripts/gate.sh
 
       - name: Publish the gate verdict
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: post-merge-gate-verdict-${{ github.sha }}
           path: |

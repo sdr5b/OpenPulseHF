@@ -506,7 +506,7 @@ fn constellation_plot(
                 .include_y(-1.8)
                 .include_y(1.8)
                 .show(ui, |p| {
-                    p.points(Points::new(pts).radius(1.2).color(color));
+                    p.points(Points::new(pts).radius(1.2_f32).color(color));
                 });
         });
     });
@@ -585,7 +585,7 @@ impl LinkApp {
         Self {
             controls: Arc::new(Mutex::new(Controls {
                 generation: 0,
-                profile: "hpx_hf".into(),
+                profile: "fast".into(),
                 channel: ChannelKind::Awgn,
                 snr_db: 5.0,
                 payload: 512,
@@ -603,7 +603,7 @@ impl LinkApp {
             rx_viz: None,
             handle: None,
             handle_viz: None,
-            ui_profile: "hpx_hf".into(),
+            ui_profile: "fast".into(),
             ui_channel: ChannelKind::Awgn,
             ui_snr: 5.0,
             ui_payload: 512,

@@ -6,7 +6,7 @@
 //! audio samples
 //!   → multiply by I/Q reference carriers
 //!   → matched-filter (half-Hann w_tail) integration per symbol period
-//!   → timing search over first symbol period (brute-force energy maximisation)
+//!   → timing search over [−n/2, n) (brute-force energy maximisation)
 //!   → differential phase detection (NRZI decode)
 //!   → bits → bytes
 //! ```
@@ -14,9 +14,11 @@
 //! ## Symbol timing
 //!
 //! The modulator prepends [`PREAMBLE_SYMS`] symbols with alternating phases
-//! (+1, −1, +1, …).  The demodulator scans every possible timing offset
-//! within the first symbol period, picks the offset that maximises the
-//! demodulated preamble energy, and uses that offset for the rest of the frame.
+//! (+1, −1, +1, …).  The demodulator scans every timing offset from half a
+//! symbol before the slice to one symbol into it (`[−n/2, n)`, #1438), picks
+//! the offset that maximises the demodulated preamble energy, and uses it for
+//! the rest of the frame. The hard path also decodes at the best offset inside
+//! `[0, n)` when that differs, and lets the FEC/CRC choose.
 //!
 //! ## Phase ambiguity
 //!
@@ -29,7 +31,9 @@ use num_complex::Complex32;
 use openpulse_core::error::ModemError;
 use openpulse_core::plugin::{ModulationConfig, PulseShape};
 use openpulse_dsp::acquisition::goertzel_carrier_scan;
-use openpulse_dsp::constellation::{additive_snr_db_windowed, differential_llr_scale};
+use openpulse_dsp::constellation::{
+    differential_llr_scale, isi_aware_snr_db_windowed, remove_residual_frequency,
+};
 use openpulse_dsp::equalizer::LmsEqualizer;
 use openpulse_dsp::farrow::FarrowTimingLoop;
 use openpulse_dsp::filter::FirFilter;
@@ -46,8 +50,9 @@ use crate::parse_baud_rate;
 /// Demodulate audio `samples` and return the recovered bytes.
 /// The symbol stream the decoder sees: matched-filtered, timing-recovered baseband I/Q.
 ///
-/// Shared by `bpsk_demodulate` and `estimate_snr_db` so the SNR is measured on exactly the symbols
-/// that were decoded, not on a separately-derived approximation.
+/// Test-only since #1438 PR1: `bpsk_demodulate` goes through `symbol_stream_with_expected`, and
+/// `estimate_snr_db` reads the UNCANCELLED parts instead of this cancelled stream.
+#[cfg(test)]
 fn symbol_stream(
     samples: &[f32],
     config: &ModulationConfig,
@@ -65,6 +70,34 @@ fn symbol_stream_with_expected(
     config: &ModulationConfig,
     expected: &[f32],
 ) -> Result<(Vec<f32>, Vec<f32>), ModemError> {
+    let (mut iv, mut qv, crossfade) = symbol_stream_parts_with_expected(samples, config, expected)?;
+    if crossfade {
+        // The overlapping half-Hann modulator is a crossfade, so the one-slot matched filter recovers
+        // `r_k = a_k + β·a_{k+1}` (β = 1/3). Left in, that `+β` term adds a constant positive bias to the
+        // differential dot product `r_k·r_{k-1}` (a_k²=1), eroding the flip-bit margin by several dB.
+        cancel_crossfade_isi(&mut iv, &mut qv);
+    }
+    Ok((iv, qv))
+}
+
+/// The symbol stream **before** the crossfade cancellation, plus whether this path crossfades at all.
+///
+/// Split out of [`symbol_stream_with_expected`] for `demodulate_variants` (#1428), which needs both
+/// the cancelled and uncancelled decisions from one timing lock — the timing search and
+/// `demodulate_iq` are the expensive terms and are shared, so the second arm costs O(symbols).
+///
+/// `estimate_snr_db` consumes the UNCANCELLED stream from here (#1438): the cancelled one reads the
+/// channel only at a lock exactly on the symbol boundary, which the widened search produces only
+/// when the frame starts about a quarter symbol into the slice.
+/// `estimate_snr_db_reads_the_uncancelled_stream` pins it.
+///
+/// The `-RRC` arm reports `false`: Gardner+LMS with no crossfade, so there is no second arm there
+/// and cancelling would inject the neighbour as error.
+fn symbol_stream_parts_with_expected(
+    samples: &[f32],
+    config: &ModulationConfig,
+    expected: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>, bool), ModemError> {
     let baud = parse_baud_rate(&config.mode)?;
     let fs = config.sample_rate as f32;
     let fc = config.center_frequency;
@@ -95,25 +128,100 @@ fn symbol_stream_with_expected(
                     .into(),
             ));
         }
-        Ok(bpsk_demodulate_rrc(
-            samples,
-            n,
-            baud,
-            fc,
-            fs,
-            alpha,
-            &config.mode,
-        ))
+        let (i, q) = bpsk_demodulate_rrc(samples, n, baud, fc, fs, alpha, &config.mode);
+        Ok((i, q, false))
     } else {
-        let offset = find_timing_offset_with_expected(samples, n, fc, fs, expected);
-        let (mut iv, mut qv) = demodulate_iq(samples, n, fc, fs, offset);
-        // The overlapping half-Hann modulator is a crossfade, so the one-slot matched filter recovers
-        // `r_k = a_k + β·a_{k+1}` (β = 1/3). Left in, that `+β` term adds a constant positive bias to the
-        // differential dot product `r_k·r_{k-1}` (a_k²=1), eroding the flip-bit margin by several dB.
-        // Cancel it here (crossfade path only; the -RRC path uses Gardner+LMS and does not crossfade).
-        cancel_crossfade_isi(&mut iv, &mut qv);
-        Ok((iv, qv))
+        let locks = timing_locks_with_expected(samples, n, fc, fs, expected);
+        let (iv, qv) = demodulate_iq_at(samples, n, fc, fs, locks.widened);
+        Ok((iv, qv, true))
     }
+}
+
+/// Every hard-decision wire this mode can produce, best-first (#1428, #1438 PR2).
+///
+/// Variant 0 is byte-identical to [`bpsk_demodulate`] — the trait contract hangs off `demodulate`,
+/// so variant 0 must keep meaning it. The variants are the two decision arms (crossfade-cancelled,
+/// then uncancelled) at the WIDENED timing lock, followed by the same two arms at the RESTRICTED
+/// lock when the two locks differ ([`TimingLocks`]), with byte-identical duplicates removed.
+///
+/// **Why two arms rather than a gate (#1428).** #1428 step 1 (PR #1432) measured the arms
+/// end-to-end with real RS — its "uncancelled" column is the soft arm sign-sliced — and cancelling
+/// won AWGN decisively (96/96 against 12/96 at −2 dB) and lost on `moderate_f1` (38/96 against
+/// 49/96 at 8 dB). The union computed from those discordant pairs, 52/96, was never below the better
+/// arm in any cell and above both on the two `moderate_f1` cells. It needs no predicate, because RS
+/// plus the length prefix and CRC-16 adjudicate which arm was right.
+///
+/// **Why two locks rather than an edge rule (#1438 PR2).** Measured over slice alignments on three
+/// rungs, AWGN and `moderate_f1`: the widened lock recovers frames starting within a quarter symbol
+/// of the slice, and loses where it reaches the −2-symbol alias or where the clamped restricted lock
+/// happens to sit nearer a fade's best phase. Rejecting a lock at the range edge lost up to 91/96 on
+/// one-shot callers. Trying both locks cannot be worse than the restricted lock alone, by
+/// construction, and measured no worse in any cell.
+///
+/// **Cost.** The timing search covers 1.5 symbol periods, both locks from one pass. The second lock
+/// costs a full `demodulate_iq` whenever the locks differ — on every attempt, not only on failure,
+/// because the variants are built eagerly.
+///
+/// Returns ONE variant where there is genuinely only one arm and one lock: the `-RRC` path does not
+/// crossfade and locks by Gardner+LMS, so a second entry there would be a byte-identical duplicate
+/// that costs an RS trial and could be miscounted as a rescue.
+pub fn bpsk_demodulate_variants(
+    samples: &[f32],
+    config: &ModulationConfig,
+) -> Result<Vec<Vec<u8>>, ModemError> {
+    let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+    let baud = parse_baud_rate(&config.mode)?;
+    let fs = config.sample_rate as f32;
+    let fc = config.center_frequency;
+    let n = samples_per_symbol(fs, baud)?;
+    let rrc = matches!(config.pulse_shape, PulseShape::Rrc { .. }) || config.mode.ends_with("-RRC");
+    if rrc || samples.len() < n * (expected.len() + 1) {
+        // The -RRC path (and the too-short refusal) are the single-lock stream.
+        let (iv, qv, crossfade) = symbol_stream_parts_with_expected(samples, config, &expected)?;
+        return variants_from_parts(iv, qv, crossfade, expected.len());
+    }
+    let locks = timing_locks_with_expected(samples, n, fc, fs, &expected);
+    let (iv, qv) = demodulate_iq_at(samples, n, fc, fs, locks.widened);
+    let mut out = variants_from_parts(iv, qv, true, expected.len())?;
+    if locks.restricted as isize != locks.widened {
+        let (iv, qv) = demodulate_iq_at(samples, n, fc, fs, locks.restricted as isize);
+        // A rescue that cannot even be framed is not an error: the widened lock's variants stand.
+        if let Ok(rescue) = variants_from_parts(iv, qv, true, expected.len()) {
+            append_distinct(&mut out, rescue);
+        }
+    }
+    Ok(out)
+}
+
+/// Append each of `more` to `out` unless an identical wire is already there — the trait bans
+/// duplicate variants (each costs an RS trial and could be miscounted as a rescue).
+fn append_distinct(out: &mut Vec<Vec<u8>>, more: Vec<Vec<u8>>) {
+    for v in more {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+}
+
+/// Shared by the CPU and GPU arms: cancelled first, uncancelled second when the path crossfades.
+///
+/// Both arms go through `bytes_from_symbol_stream`, so the framing cannot drift between them —
+/// which is the structural half of #1433's lesson, where the GPU path's own copy of the slice
+/// silently lacked the cancellation for 71 days.
+fn variants_from_parts(
+    iv: Vec<f32>,
+    qv: Vec<f32>,
+    crossfade: bool,
+    preamble_syms: usize,
+) -> Result<Vec<Vec<u8>>, ModemError> {
+    if !crossfade {
+        return Ok(vec![bytes_from_symbol_stream(&iv, &qv, preamble_syms)?]);
+    }
+    let (mut ci, mut cq) = (iv.clone(), qv.clone());
+    cancel_crossfade_isi(&mut ci, &mut cq);
+    let cancelled = bytes_from_symbol_stream(&ci, &cq, preamble_syms)?;
+    let uncancelled = bytes_from_symbol_stream(&iv, &qv, preamble_syms)?;
+    Ok(vec![cancelled, uncancelled])
 }
 
 /// Absolute additive SNR (dB) of a received BPSK frame — the rate controller's input.
@@ -126,28 +234,76 @@ fn symbol_stream_with_expected(
 /// bottom rung, delivering nothing on a routine HF fade (issue #934).
 ///
 /// The fix is the same one `openpulse_channel::estimate_additive_snr_db` applies to raw audio:
-/// remove the *multiplicative* channel with a per-window least-squares gain before measuring the
+/// remove the *multiplicative* channel with a per-window least-squares fit before measuring the
 /// residual. BPSK is differentially decoded, so the transmitted ±1 sequence is reconstructed from the
-/// decisions the decoder already made; its arbitrary global sign is absorbed by the per-window gain.
+/// decisions the decoder already made; its arbitrary global sign is absorbed by the per-window fit.
 pub fn estimate_snr_db(samples: &[f32], config: &ModulationConfig) -> Option<f32> {
-    let (i_syms, q_syms) = symbol_stream(samples, config).ok()?;
+    let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+    let (i_syms, q_syms, _) = symbol_stream_parts_with_expected(samples, config, &expected).ok()?;
+    snr_db_from_uncancelled_stream(&i_syms, &q_syms, config)
+}
+
+/// The estimate proper, on the **uncancelled** symbol stream (#1438).
+///
+/// Until #1438 this read the crossfade-CANCELLED stream with a one-tap fit, which reads the channel
+/// only when the timing lock sits exactly on the symbol boundary. The search locks ≈ a quarter
+/// symbol early whenever the frame starts at least that far into the slice, and there the
+/// cancellation injects error: measured at BPSK250, −0.28 of a symbol, it read ≈ 3 dB at every true
+/// SNR from 10 to 30 dB (slope 0.09; the level is phase-dependent, the flatness is not). The
+/// uncancelled stream sampled early carries two neighbour taps instead, which the three-tap fit of
+/// [`isi_aware_snr_db_windowed`] removes; the residual carrier offset the AFC leaves inside its 2 Hz
+/// deadband is removed first by [`remove_residual_frequency`], since a phase ramp inside a window is
+/// the one thing a per-window tap cannot absorb.
+fn snr_db_from_uncancelled_stream(
+    i_syms: &[f32],
+    q_syms: &[f32],
+    config: &ModulationConfig,
+) -> Option<f32> {
     if i_syms.len() <= PREAMBLE_SYMS + TAIL_SYMS {
         return None;
     }
+    // The last preamble symbol serves only as the first differential reference; the period-4
+    // preamble itself spans too few independent taps to fit.
     let range_start = PREAMBLE_SYMS - 1;
     let end = i_syms.len() - TAIL_SYMS;
     if range_start >= end {
         return None;
     }
-    let rx: Vec<Complex32> = i_syms[range_start..end]
+    let mut rx: Vec<Complex32> = i_syms[range_start..end]
         .iter()
         .zip(q_syms[range_start..end].iter())
         .map(|(&i, &q)| Complex32::new(i, q))
         .collect();
+    let decisions = decisions_from_differential(&rx);
+    remove_residual_frequency(&mut rx, &decisions);
+    // A window is a DURATION trade: the phase-ramp floor of a Doppler-spread fade falls ≈ 6 dB per
+    // halving, while the fit's bias grows as 1/(W·Es/N0) — 8 symbols is where that bias is still
+    // ≈ 0.05 dB at the ladder's lowest floors (#1438).
+    const WINDOW_SYMS: usize = 8;
+    let es_n0 = isi_aware_snr_db_windowed(&rx, &decisions, WINDOW_SYMS)?;
+
+    // Convert symbol-domain Es/N0 to the *channel* SNR scale the rate ladder's floors are written in.
+    // The estimate is taken after the matched filter, so it carries the mode's processing gain — a
+    // 31-baud rung reads ~17 dB above the channel SNR and a 250-baud rung ~8 dB. Left unconverted the
+    // receiver over-recommends badly (a 2 dB AWGN channel drove the ladder to SL5), which is just the
+    // #934 scale defect wearing a different hat: never compare one scale's number against another's.
+    //
+    // The offset is `10·log10(fs/baud) − MATCHED_FILTER_LOSS_DB`, fitted on AWGN for the Hann pulse.
+    // It is a function of the sampling phase: across the phases the timing search lands on (−0.45 to
+    // −0.10 of a symbol) it spans ±0.3 dB; at exactly the boundary it reads ≈ 1 dB low, and later than
+    // the boundary it falls away fast. `snr_estimate_tracks_awgn_at_every_early_phase` pins it.
+    const MATCHED_FILTER_LOSS_DB: f32 = 4.4;
+    let baud = parse_baud_rate(&config.mode).ok()?;
+    let fs = config.sample_rate as f32;
+    let processing_gain_db = 10.0 * (fs / baud).log10();
+    Some(es_n0 - processing_gain_db + MATCHED_FILTER_LOSS_DB)
+}
+
+/// Rebuild the transmitted ±1 sequence from a differential decode: each "1" flips the phase. The
+/// starting sign is unknown and does not matter — the per-window fit absorbs it.
+fn decisions_from_differential(rx: &[Complex32]) -> Vec<Complex32> {
     let iq: Vec<(f32, f32)> = rx.iter().map(|z| (z.re, z.im)).collect();
     let bits = differential_decode(&iq);
-    // Rebuild the transmitted symbols from the differential decisions: each "1" flips the phase.
-    // The starting sign is unknown and does not matter — the per-window LS gain absorbs it.
     let mut decisions = Vec::with_capacity(rx.len());
     let mut cur = Complex32::new(1.0, 0.0);
     decisions.push(cur);
@@ -157,24 +313,7 @@ pub fn estimate_snr_db(samples: &[f32], config: &ModulationConfig) -> Option<f32
         }
         decisions.push(cur);
     }
-    const WINDOW_SYMS: usize = 16;
-    let es_n0 = additive_snr_db_windowed(&rx, &decisions, WINDOW_SYMS);
-
-    // Convert symbol-domain Es/N0 to the *channel* SNR scale the rate ladder's floors are written in.
-    // The estimate is taken after the matched filter, so it carries the mode's processing gain — a
-    // 31-baud rung reads ~17 dB above the channel SNR and a 250-baud rung ~8 dB. Left unconverted the
-    // receiver over-recommends badly (a 2 dB AWGN channel drove the ladder to SL5), which is just the
-    // #934 scale defect wearing a different hat: never compare one scale's number against another's.
-    //
-    // Measured on AWGN, the offset is `10·log10(fs/baud) − MATCHED_FILTER_LOSS_DB` and the constant
-    // holds to ~0.3 dB across BPSK31 and BPSK250 — an order of magnitude apart in baud — so it is the
-    // pulse's noise-bandwidth loss, not a per-mode fudge. It IS pulse-specific: it is fitted to this
-    // plugin's Hann/crossfade matched filter. `bpsk_snr_awgn_scale_matches_channel_snr` pins it.
-    const MATCHED_FILTER_LOSS_DB: f32 = 7.1;
-    let baud = parse_baud_rate(&config.mode).ok()?;
-    let fs = config.sample_rate as f32;
-    let processing_gain_db = 10.0 * (fs / baud).log10();
-    Some(es_n0 - processing_gain_db + MATCHED_FILTER_LOSS_DB)
+    decisions
 }
 
 pub fn bpsk_demodulate(samples: &[f32], config: &ModulationConfig) -> Result<Vec<u8>, ModemError> {
@@ -196,6 +335,20 @@ pub fn bpsk_demodulate_with_expected(
     // so the SNR is measured on exactly the symbols that get decoded.
     let (i_syms, q_syms) = symbol_stream_with_expected(samples, config, expected)?;
 
+    bytes_from_symbol_stream(&i_syms, &q_syms, preamble_syms)
+}
+
+/// Slice the data span out of a symbol stream and differentially decode it to bytes.
+///
+/// Extracted from [`bpsk_demodulate_with_expected`] so the cancelled and uncancelled arms of
+/// `demodulate_variants` (#1428) and the GPU path all reach bytes through ONE piece of framing
+/// logic. Previously the CPU and GPU paths each open-coded this slice; the GPU copy is how
+/// #1433 went 71 days without the cancellation.
+fn bytes_from_symbol_stream(
+    i_syms: &[f32],
+    q_syms: &[f32],
+    preamble_syms: usize,
+) -> Result<Vec<u8>, ModemError> {
     if i_syms.len() <= preamble_syms + TAIL_SYMS {
         return Err(ModemError::Demodulation(
             "no data symbols after preamble".into(),
@@ -205,25 +358,20 @@ pub fn bpsk_demodulate_with_expected(
     // Differential phase detection (handles absolute-phase ambiguity).
     // We take consecutive (I,Q) pairs and compute Re(z[k] * conj(z[k-1])).
     // Positive → same phase → NRZI "0" (no flip); negative → "1" (flip).
-    let data_syms_start = preamble_syms;
     let data_syms_end = i_syms.len() - TAIL_SYMS;
-
-    if data_syms_start >= data_syms_end {
+    if preamble_syms >= data_syms_end {
         return Ok(vec![]);
     }
 
-    // Build the full range including the last preamble symbol as the reference
-    // for the first data bit.
-    let range_start = preamble_syms - 1; // include prev preamble symbol as reference
+    // Include the last preamble symbol as the reference for the first data bit.
+    let range_start = preamble_syms - 1;
     let iq: Vec<(f32, f32)> = i_syms[range_start..data_syms_end]
         .iter()
         .zip(q_syms[range_start..data_syms_end].iter())
         .map(|(&i, &q)| (i, q))
         .collect();
 
-    let bits = differential_decode(&iq);
-    let bytes = bits_to_bytes(&bits);
-    Ok(bytes)
+    Ok(bits_to_bytes(&differential_decode(&iq)))
 }
 
 // ── AFC frequency-offset estimator ───────────────────────────────────────────
@@ -305,9 +453,9 @@ pub fn afc_estimate_hz(samples: &[f32], config: &ModulationConfig) -> Option<f32
 
 /// [`afc_estimate_hz`] whose stage-2 timing lock uses a supplied expectation.
 ///
-/// Stage 2 calls [`find_timing_offset`], which correlates against the expected
-/// preamble — so estimating AFC on candidate-preamble audio through the shipped
-/// entry point measures a TX/RX mismatch, not the candidate.
+/// Stage 2 locks timing with [`timing_locks_with_expected`] (the widened lock), which correlates
+/// against the expected preamble — so estimating AFC on candidate-preamble audio through the
+/// shipped entry point measures a TX/RX mismatch, not the candidate.
 pub fn afc_estimate_hz_with_expected(
     samples: &[f32],
     config: &ModulationConfig,
@@ -328,8 +476,8 @@ pub fn afc_estimate_hz_with_expected(
     // eliminate the sub-step quantisation error (≤ 6.25 Hz).
     let c = coarse.unwrap_or(0.0);
     let corrected_fc = config.center_frequency + c;
-    let offset = find_timing_offset_with_expected(samples, n, corrected_fc, fs, expected);
-    let (i_syms, q_syms) = demodulate_iq(samples, n, corrected_fc, fs, offset);
+    let lock = timing_locks_with_expected(samples, n, corrected_fc, fs, expected).widened;
+    let (i_syms, q_syms) = demodulate_iq_at(samples, n, corrected_fc, fs, lock);
     let residual = estimate_frequency_offset(&i_syms, &q_syms, baud);
 
     // The residual should be within ±baud/4 of 0 after Goertzel correction.
@@ -375,14 +523,15 @@ pub fn bpsk_demodulate_soft(
     let (i_syms, q_syms) = if let Some(alpha) = rrc_alpha {
         bpsk_demodulate_rrc(samples, n, baud, fc, fs, alpha, &config.mode)
     } else {
-        let offset = find_timing_offset(samples, n, fc, fs);
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let lock = timing_locks_with_expected(samples, n, fc, fs, &expected).widened;
         // NOTE: crossfade-ISI cancellation is deliberately NOT applied on the soft path. BPSK is
         // *differential*, so the backward-substitution recursion inflates the noise LLRs of a deeply
-        // faded attempt instead of suppressing them — that breaks the 1/σ² LLR calibration HARQ MAP
+        // faded attempt instead of suppressing them — that breaks the LLR calibration HARQ MAP
         // combining relies on (regressed `llr_calibration::a_deeply_faded_extra_attempt_does_not_hurt`).
         // The cancellation stays on the hard differential path (`bpsk_demodulate`), where it restores the
         // decision margin without disturbing any soft-combining scale.
-        demodulate_iq(samples, n, fc, fs, offset)
+        demodulate_iq_at(samples, n, fc, fs, lock)
     };
 
     if i_syms.len() <= PREAMBLE_SYMS + TAIL_SYMS {
@@ -420,7 +569,9 @@ pub fn bpsk_demodulate_soft(
         })
         .collect();
 
-    // Calibrate the soft values into *true* log-likelihood ratios (magnitude ∝ 1/σ²). Nothing that
+    // Calibrate the soft values into *true* log-likelihood ratios. The target is the DBPSK LLR
+    // slope `2A²/var(dot)`, NOT `1/σ²` — that is only its high-SNR limit, and holding it all the
+    // way down is what let a signal-free attempt vote at full strength (#1364). Nothing that
     // decodes a single frame notices — soft Viterbi, min-sum LDPC and max-log turbo are all
     // scale-invariant — but HARQ soft combining across receive attempts does: uncalibrated, an attempt
     // from a deep fade votes as loudly as a clean one. See `openpulse_core::fec::combine_llrs_map`.
@@ -515,6 +666,52 @@ fn bpsk_demodulate_rrc_gpu(
     Ok(bits_to_bytes(&bits))
 }
 
+/// The GPU path's symbol stream **before** cancellation, or `None` when it must fall back to CPU.
+///
+/// The GPU counterpart of `symbol_stream_parts_with_expected`. Both GPU consumers — the single-arm
+/// `bpsk_demodulate_with_gpu` and the two-arm `bpsk_demodulate_variants_with_gpu` — acquire through
+/// this one function, so the arms cannot drift apart again the way the GPU slice drifted from the
+/// CPU one in #1433.
+///
+/// `None` means "no GPU answer" (the timing search or the IQ kernel declined) and the caller falls
+/// back to the CPU path. Errors are real demodulation failures and propagate.
+#[cfg(feature = "gpu")]
+#[allow(clippy::type_complexity)]
+fn gpu_symbol_stream_parts(
+    samples: &[f32],
+    config: &ModulationConfig,
+    ctx: &openpulse_gpu::GpuContext,
+) -> Result<Option<(TimingLocks, Vec<f32>, Vec<f32>)>, ModemError> {
+    let baud = parse_baud_rate(&config.mode)?;
+    let fs = config.sample_rate as f32;
+    let fc = config.center_frequency;
+    let n = samples_per_symbol(fs, baud)?;
+
+    if samples.len() < n * (PREAMBLE_SYMS + 1) {
+        return Err(ModemError::Demodulation("signal too short".into()));
+    }
+
+    let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+    let half = n / 2;
+    let Some(energies) = openpulse_gpu::timing_energies_gpu(
+        ctx,
+        samples,
+        n,
+        PREAMBLE_SYMS,
+        &expected,
+        fc,
+        fs,
+        -(half as isize),
+    ) else {
+        return Ok(None);
+    };
+    let locks = locks_from_energies(&energies, half);
+    Ok(
+        openpulse_gpu::bpsk_iq_demod_gpu(ctx, samples, n, fc, fs, locks.widened)
+            .map(|(iv, qv)| (locks, iv, qv)),
+    )
+}
+
 /// GPU-accelerated demodulation path.
 #[cfg(feature = "gpu")]
 pub fn bpsk_demodulate_with_gpu(
@@ -527,56 +724,66 @@ pub fn bpsk_demodulate_with_gpu(
         return bpsk_demodulate_rrc_gpu(samples, config, ctx);
     }
 
-    let baud = parse_baud_rate(&config.mode)?;
-    let fs = config.sample_rate as f32;
-    let fc = config.center_frequency;
-    let n = samples_per_symbol(fs, baud)?;
-
-    if samples.len() < n * (PREAMBLE_SYMS + 1) {
-        return Err(ModemError::Demodulation("signal too short".into()));
-    }
-
-    let expected = expected_preamble_symbols(PREAMBLE_SYMS);
-    let offset = match openpulse_gpu::timing_offset_search_gpu(
-        ctx,
-        samples,
-        n,
-        PREAMBLE_SYMS,
-        &expected,
-        fc,
-        fs,
-    ) {
-        Some(o) => o,
-        None => return bpsk_demodulate(samples, config),
+    let Some((_, mut i_syms, mut q_syms)) = gpu_symbol_stream_parts(samples, config, ctx)? else {
+        return bpsk_demodulate(samples, config);
     };
 
-    let effective = &samples[offset.min(samples.len())..];
-    let (i_syms, q_syms) = match openpulse_gpu::bpsk_iq_demod_gpu(ctx, effective, n, fc, fs, offset)
-    {
-        Some(iq) => iq,
-        None => return bpsk_demodulate(samples, config),
+    // #1433: the CPU arm cancels the crossfade ISI inside `symbol_stream_with_expected`
+    // (`demodulate.rs`, the `cancel_crossfade_isi` call after `demodulate_iq`); this path landed
+    // 2026-05-04 and #821 added the cancellation 2026-07-13 to that function only, so the GPU arm
+    // decoded the uncancelled `r_k = a_k + β·a_{k+1}` for 71 days. Measured on a 200 B frame at
+    // 0 dB total-power SNR: uncancelled 0/16 frames against the CPU arm's 11/16.
+    //
+    // Applied to the WHOLE symbol stream before the preamble/tail slice below, because the
+    // cancellation is a backward substitution — running it on a slice changes the boundary symbol.
+    // That is the CPU ordering, and `gpu_and_cpu_agree_where_the_cancellation_decides_the_frame`
+    // is what holds the two together.
+    cancel_crossfade_isi(&mut i_syms, &mut q_syms);
+
+    bytes_from_symbol_stream(&i_syms, &q_syms, PREAMBLE_SYMS)
+}
+
+/// GPU counterpart of [`bpsk_demodulate_variants`] — both decision arms at both timing locks.
+///
+/// The daemon is `default = ["gpu"]` and registers `BpskPlugin::with_gpu` whenever an adapter is
+/// present, so a variants implementation that only covered the CPU path would ship the union
+/// invisible on the binary that runs on air. That is exactly #1433's shape, one method over, and
+/// it is why this function exists rather than a `self.demodulate()` fallback.
+#[cfg(feature = "gpu")]
+pub fn bpsk_demodulate_variants_with_gpu(
+    samples: &[f32],
+    config: &ModulationConfig,
+    ctx: &openpulse_gpu::GpuContext,
+) -> Result<Vec<Vec<u8>>, ModemError> {
+    // The RRC arm does not crossfade, so it has one arm and the CPU path reports that correctly.
+    if matches!(config.pulse_shape, PulseShape::Rrc { .. }) || config.mode.ends_with("-RRC") {
+        return bpsk_demodulate_variants(samples, config);
+    }
+    let Some((locks, iv, qv)) = gpu_symbol_stream_parts(samples, config, ctx)? else {
+        // A GPU fallback takes the CPU path, which reports its own arm count.
+        return bpsk_demodulate_variants(samples, config);
     };
-
-    if i_syms.len() <= PREAMBLE_SYMS + TAIL_SYMS {
-        return Err(ModemError::Demodulation(
-            "no data symbols after preamble".into(),
-        ));
+    let mut out = variants_from_parts(iv, qv, true, PREAMBLE_SYMS)?;
+    // The restricted-lock rescue (#1438 PR2), as on the CPU path.
+    if locks.restricted as isize != locks.widened {
+        let baud = parse_baud_rate(&config.mode)?;
+        let fs = config.sample_rate as f32;
+        let n = samples_per_symbol(fs, baud)?;
+        let rescue = openpulse_gpu::bpsk_iq_demod_gpu(
+            ctx,
+            samples,
+            n,
+            config.center_frequency,
+            fs,
+            locks.restricted as isize,
+        );
+        if let Some(Ok(rescue)) =
+            rescue.map(|(iv, qv)| variants_from_parts(iv, qv, true, PREAMBLE_SYMS))
+        {
+            append_distinct(&mut out, rescue);
+        }
     }
-
-    let data_syms_end = i_syms.len() - TAIL_SYMS;
-    if PREAMBLE_SYMS >= data_syms_end {
-        return Ok(vec![]);
-    }
-
-    let range_start = PREAMBLE_SYMS - 1;
-    let iq: Vec<(f32, f32)> = i_syms[range_start..data_syms_end]
-        .iter()
-        .zip(q_syms[range_start..data_syms_end].iter())
-        .map(|(&i, &q)| (i, q))
-        .collect();
-
-    let bits = differential_decode(&iq);
-    Ok(bits_to_bytes(&bits))
+    Ok(out)
 }
 
 // ── RRC baseband demodulation path ───────────────────────────────────────────
@@ -795,22 +1002,13 @@ fn find_timing_offset_bb(i_bb: &[f32], q_bb: &[f32], n: usize) -> usize {
     best_off
 }
 
-/// Try every possible timing offset within one symbol period.  Return the
-/// offset that gives the maximum preamble correlation magnitude.
-fn find_timing_offset(samples: &[f32], n: usize, fc: f32, fs: f32) -> usize {
-    find_timing_offset_with_expected(
-        samples,
-        n,
-        fc,
-        fs,
-        &expected_preamble_symbols(PREAMBLE_SYMS),
-    )
-}
-
-/// [`find_timing_offset`] correlating against a supplied expectation.
+/// The timing search correlating against a supplied expectation — the RESTRICTED search over
+/// offsets `[0, n)`.
 ///
-/// The search span follows `expected.len()` rather than [`PREAMBLE_SYMS`], so a
-/// candidate preamble is searched over its own length.
+/// Production decodes use both halves of [`timing_locks_with_expected`]; this is the restricted
+/// half, kept as its own entry point because it is the lock BPSK shipped with and the one the #1438
+/// P6 rescue falls back to. The search span follows `expected.len()` rather than [`PREAMBLE_SYMS`],
+/// so a candidate preamble is searched over its own length.
 pub fn find_timing_offset_with_expected(
     samples: &[f32],
     n: usize,
@@ -818,19 +1016,76 @@ pub fn find_timing_offset_with_expected(
     fs: f32,
     expected: &[f32],
 ) -> usize {
-    let mut best_energy = f32::NEG_INFINITY;
-    let mut best_offset = 0usize;
-    let syms = expected.len();
+    let energies = preamble_energies(samples, n, fc, fs, expected, 0);
+    pick_lock(&energies).unwrap_or(0)
+}
 
-    for offset in 0..n {
-        if samples.len() < offset + n * syms {
+/// The two timing locks #1438's P6 decodes at (PR2).
+///
+/// `widened` is the first-max over offsets `[−n/2, n)`; `restricted` the first-max over `[0, n)`,
+/// the lock BPSK shipped with. The search's objective peaks about a quarter symbol before the
+/// boundary, so when a frame starts within a quarter symbol of the slice the restricted search
+/// cannot reach that peak and is clamped late, where the stronger decision arm fails; the widened
+/// search reaches it. It can also reach the −2-symbol alias of the period-4 preamble when a frame
+/// starts ~1.5 symbols into the slice — where the restricted lock still decodes. No edge rule
+/// separates the two (measured: both sit at the widened range's lower edge), so the decoder tries
+/// both and the FEC/CRC adjudicates, exactly as #1428's union does for the two decision arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimingLocks {
+    /// First-max over `[−n/2, n)`; the lock every single-lock consumer uses.
+    pub(crate) widened: isize,
+    /// First-max over `[0, n)`; the rescue.
+    pub(crate) restricted: usize,
+}
+
+/// Both timing locks from ONE pass of the preamble correlation over `[−n/2, n)`.
+pub(crate) fn timing_locks_with_expected(
+    samples: &[f32],
+    n: usize,
+    fc: f32,
+    fs: f32,
+    expected: &[f32],
+) -> TimingLocks {
+    let half = n / 2;
+    let energies = preamble_energies(samples, n, fc, fs, expected, -(half as isize));
+    locks_from_energies(&energies, half)
+}
+
+/// Both locks from an energy array whose index 0 is offset `−half`: the one composition the CPU
+/// and GPU searches share, so they cannot choose differently from identical energies.
+fn locks_from_energies(energies: &[f32], half: usize) -> TimingLocks {
+    let restricted = pick_lock(energies.get(half..).unwrap_or(&[])).unwrap_or(0);
+    let widened = pick_lock(energies).map_or(restricted as isize, |i| i as isize - half as isize);
+    TimingLocks {
+        widened,
+        restricted,
+    }
+}
+
+/// The preamble correlation energy at every offset from `first` up to `n − 1`, in order.
+///
+/// Evaluation stops at the first offset whose preamble span runs past the end of `samples`, as the
+/// shipped search did; offsets that could not be evaluated are absent, never a sentinel value.
+fn preamble_energies(
+    samples: &[f32],
+    n: usize,
+    fc: f32,
+    fs: f32,
+    expected: &[f32],
+    first: isize,
+) -> Vec<f32> {
+    let syms = expected.len();
+    let mut out = Vec::with_capacity((n as isize - first).max(0) as usize);
+    for offset in first..n as isize {
+        let span_end = offset + (n * syms) as isize;
+        if (samples.len() as isize) < span_end {
             break;
         }
         // Demodulate ONLY the preamble span at this offset (the slice may be
         // multi-second; demodulating all of it per offset is O(offsets × N)).
-        let span_end = (offset + n * syms).min(samples.len());
-        let (i_syms, q_syms) = demodulate_iq(&samples[..span_end], n, fc, fs, offset);
+        let (i_syms, q_syms) = demodulate_iq_at(&samples[..span_end as usize], n, fc, fs, offset);
         if i_syms.len() < syms {
+            out.push(f32::NEG_INFINITY);
             continue;
         }
 
@@ -847,15 +1102,22 @@ pub fn find_timing_offset_with_expected(
             .fold((0.0f32, 0.0f32), |(re, im), ((&i, &q), &e)| {
                 (re + i * e, im + q * e)
             });
-        let energy = re * re + im * im;
+        out.push(re * re + im * im);
+    }
+    out
+}
 
-        if energy > best_energy {
-            best_energy = energy;
-            best_offset = offset;
+/// First-max index of `energies`, shared by the CPU and GPU searches so their locks cannot drift
+/// apart on a tie. NaN never wins (it compares false), and neither does −∞; `None` when nothing
+/// qualifies.
+pub(crate) fn pick_lock(energies: &[f32]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &e) in energies.iter().enumerate() {
+        if e > best.map_or(f32::NEG_INFINITY, |(_, b)| b) {
+            best = Some((i, e));
         }
     }
-
-    best_offset
+    best.map(|(i, _)| i)
 }
 
 /// Build the expected I-channel amplitudes for the preamble.
@@ -886,7 +1148,9 @@ pub fn expected_symbols_for(bits: &[bool]) -> Vec<f32> {
 /// Mix `samples` with I and Q reference carriers, apply the matched filter
 /// (half-Hann w_tail, 1→0) and integrate over each symbol period.
 ///
-/// Returns `(i_values, q_values)` — one value per symbol.
+/// Returns `(i_values, q_values)` — one value per symbol. Test-only since #1438 PR2: production
+/// calls [`demodulate_iq_at`] with a signed lock.
+#[cfg(test)]
 fn demodulate_iq(
     samples: &[f32],
     n: usize,
@@ -894,8 +1158,30 @@ fn demodulate_iq(
     fs: f32,
     offset: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let effective = &samples[offset.min(samples.len())..];
-    let n_syms = effective.len() / n;
+    demodulate_iq_at(samples, n, fc, fs, offset as isize)
+}
+
+/// [`demodulate_iq`] at a SIGNED offset (#1438 PR2): a negative offset starts the first symbol's
+/// window before the slice, and those samples read as zero. That is exact when the frame starts at
+/// the slice (symbol 0's head is never transmitted: slot k carries a_k·w_tail + a_{k+1}·w_head) and
+/// immaterial otherwise, because symbol 0 only enters the preamble correlation and is never data.
+///
+/// The carrier is referenced by the ABSOLUTE sample index, so for a non-negative offset every
+/// output is bit-identical to the unsigned demodulator this replaced: the restricted timing lock
+/// (`find_timing_offset_with_expected`) must not move under a PR that only adds a second lock.
+fn demodulate_iq_at(
+    samples: &[f32],
+    n: usize,
+    fc: f32,
+    fs: f32,
+    offset: isize,
+) -> (Vec<f32>, Vec<f32>) {
+    let len = samples.len() as isize;
+    let n_syms = if len > offset {
+        (len - offset) as usize / n
+    } else {
+        0
+    };
     let two_pi = 2.0 * PI;
 
     let mut i_out = Vec::with_capacity(n_syms);
@@ -908,8 +1194,9 @@ fn demodulate_iq(
         let mut norm = 0.0f32;
 
         for i in 0..n {
-            let global_n = (offset + sym_start + i) as f32;
-            let sample = effective[sym_start + i];
+            let idx = offset + (sym_start + i) as isize;
+            let sample = if idx < 0 { 0.0 } else { samples[idx as usize] };
+            let global_n = idx as f32;
 
             // Matched filter for the overlapping half-Hann modulator: the
             // decreasing half (w_tail = 1→0) correlates with the current
@@ -992,6 +1279,755 @@ pub(crate) fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snr_fixture() -> (Vec<f32>, ModulationConfig) {
+        let cfg = ModulationConfig {
+            mode: "BPSK250".to_string(),
+            sample_rate: 8000,
+            center_frequency: 1500.0,
+            pulse_shape: PulseShape::Hann,
+            ..Default::default()
+        };
+        let payload: Vec<u8> = (0..120u32)
+            .map(|i| (i.wrapping_mul(97) >> 3) as u8)
+            .collect();
+        let tx = crate::modulate::bpsk_modulate(&payload, &cfg).expect("modulate");
+        (tx, cfg)
+    }
+
+    /// The demodulator as it was before #1438 PR2 made the offset signed — kept VERBATIM as the
+    /// reference the bit-identity test compares against. Do not "tidy" it: its value is that it is the
+    /// shipped code, not a re-derivation.
+    fn demodulate_iq_pre_pr2(
+        samples: &[f32],
+        n: usize,
+        fc: f32,
+        fs: f32,
+        offset: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let effective = &samples[offset.min(samples.len())..];
+        let n_syms = effective.len() / n;
+        let two_pi = 2.0 * PI;
+        let mut i_out = Vec::with_capacity(n_syms);
+        let mut q_out = Vec::with_capacity(n_syms);
+        for sym_idx in 0..n_syms {
+            let sym_start = sym_idx * n;
+            let mut i_sum = 0.0f32;
+            let mut q_sum = 0.0f32;
+            let mut norm = 0.0f32;
+            for i in 0..n {
+                let global_n = (offset + sym_start + i) as f32;
+                let sample = effective[sym_start + i];
+                let window = 0.5 * (1.0 + (PI * i as f32 / n as f32).cos());
+                let t = global_n / fs;
+                let ci = (two_pi * fc * t).cos();
+                let cq = -(two_pi * fc * t).sin();
+                i_sum += sample * ci * window * 2.0;
+                q_sum += sample * cq * window * 2.0;
+                norm += window * window;
+            }
+            if norm > 1e-9 {
+                i_sum /= norm;
+                q_sum /= norm;
+            }
+            i_out.push(i_sum);
+            q_out.push(q_sum);
+        }
+        (i_out, q_out)
+    }
+
+    /// #1438 PR2's "no regression" rests on this: at every non-negative offset the signed
+    /// demodulator is BIT-identical to the one it replaced, so the restricted lock — the rescue —
+    /// is exactly today's lock, not merely close to it. (A padded-buffer emulation of the widened
+    /// search flipped one near-tie in 7 329 during PR2's measurement.)
+    #[test]
+    fn the_signed_demodulator_is_bit_identical_at_non_negative_offsets() {
+        let (tx, cfg) = snr_fixture();
+        let noisy = awgn(&tx, 3.0, 17);
+        for off in 0..40usize {
+            let (ri, rq) = demodulate_iq_pre_pr2(&noisy, 32, cfg.center_frequency, 8000.0, off);
+            let (gi, gq) = demodulate_iq_at(&noisy, 32, cfg.center_frequency, 8000.0, off as isize);
+            assert!(
+                ri.iter().zip(&gi).all(|(a, b)| a.to_bits() == b.to_bits()) && ri.len() == gi.len(),
+                "offset {off}: I differs from the pre-PR2 demodulator"
+            );
+            assert!(
+                rq.iter().zip(&gq).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "offset {off}: Q differs from the pre-PR2 demodulator"
+            );
+        }
+    }
+
+    /// A negative lock reads zeros before the slice and keeps the ABSOLUTE carrier index: it must
+    /// equal demodulating the same buffer with that many zeros prepended, at the shifted offset, up
+    /// to the carrier rotation the shift introduces — so compare the symbol count and each symbol's
+    /// magnitude, which the rotation cannot change.
+    #[test]
+    fn a_negative_lock_reads_zeros_before_the_slice() {
+        let (tx, cfg) = snr_fixture();
+        let fc = cfg.center_frequency;
+        for k in [1usize, 8, 16] {
+            let (i_neg, q_neg) = demodulate_iq_at(&tx, 32, fc, 8000.0, -(k as isize));
+            assert_eq!(i_neg.len(), (tx.len() + k) / 32, "lock −{k}: symbol count");
+            let mut padded = vec![0.0f32; k];
+            padded.extend_from_slice(&tx);
+            let (i_pad, q_pad) = demodulate_iq_at(&padded, 32, fc, 8000.0, 0);
+            assert_eq!(i_pad.len(), i_neg.len(), "lock −{k}: padded symbol count");
+            for (s, ((a, b), (c, d))) in i_neg
+                .iter()
+                .zip(&q_neg)
+                .zip(i_pad.iter().zip(&q_pad))
+                .enumerate()
+            {
+                let (m1, m2) = ((a * a + b * b).sqrt(), (c * c + d * d).sqrt());
+                assert!(
+                    (m1 - m2).abs() <= 1e-3 * m2.max(1.0),
+                    "lock −{k}, symbol {s}: |{m1}| vs padded |{m2}|"
+                );
+            }
+        }
+    }
+
+    /// The uncoded wire bytes of one frame, and the frame's payload.
+    fn framed_wire(seq: u16) -> (Vec<u8>, Vec<u8>) {
+        let payload: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let frame = openpulse_core::frame::Frame::new(seq, payload.clone())
+            .expect("frame")
+            .encode();
+        (openpulse_core::scramble::scrambled(&frame), payload)
+    }
+
+    fn variant_decodes(variant: &[u8], payload: &[u8]) -> bool {
+        let mut w = variant.to_vec();
+        openpulse_core::scramble::scramble(&mut w);
+        openpulse_core::frame::Frame::decode(&w)
+            .map(|f| f.payload == payload)
+            .unwrap_or(false)
+    }
+
+    /// The expectation parameter actually reaches the timing lock (moved from
+    /// `tests/preamble_seam_identity.rs`, which cannot see the crate-private lock).
+    ///
+    /// The RX-side anti-vacuity tripwire: stage-2 AFC and the decoder both lock timing by
+    /// correlating against the expectation, so feeding candidate audio through the shipped entry
+    /// point measures a TX/RX mismatch rather than the candidate. The corruption has to be
+    /// near-orthogonal to the shipped sequence: flipping every third symbol still locks to the
+    /// correct offset, and a full inversion is invariant by design (the metric is magnitude).
+    /// Asserted on the LOCK: a byte comparison stopped discriminating when #1438 PR2 widened the
+    /// search, since most offsets in the wider span decode the same bytes noiselessly.
+    #[test]
+    fn the_expectation_parameter_actually_reaches_the_timing_lock() {
+        let wrong: Vec<f32> = (0..PREAMBLE_SYMS)
+            .map(|i| {
+                if i.wrapping_mul(2_654_435_761) % 2 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            })
+            .collect();
+        let cfg = ModulationConfig {
+            mode: "BPSK250".into(),
+            ..ModulationConfig::default()
+        };
+        let tx = crate::modulate::bpsk_modulate(b"OPENPULSE parity seam", &cfg).expect("modulate");
+        let (n, fc, fs) = (32, cfg.center_frequency, cfg.sample_rate as f32);
+        let shipped = expected_preamble_symbols(PREAMBLE_SYMS);
+        let right = timing_locks_with_expected(&tx, n, fc, fs, &shipped);
+        let under_wrong = timing_locks_with_expected(&tx, n, fc, fs, &wrong);
+        assert_ne!(
+            under_wrong, right,
+            "a corrupted expectation produced the same timing locks — the expectation parameter is inert"
+        );
+    }
+
+    /// The P6 rescue (#1438 PR2): a frame 1.625 symbols into the slice puts the widened search on
+    /// the −2-symbol alias of the period-4 preamble, which the restricted lock does not reach.
+    /// Measured in PR2's sweep; asserted here noiselessly, for both production framings — uncoded
+    /// and `Rs` — since the symbols after the preamble decide whether the alias holds. Their first
+    /// wire bytes are fixed (magic, then whitening), and pinned here. The widened lock's arms must
+    /// FAIL (else the fixture has no alias and proves nothing) and a restricted-lock arm must
+    /// decode.
+    #[test]
+    fn the_restricted_lock_rescues_a_frame_the_widened_lock_aliases() {
+        use openpulse_core::{fec::FecCodec, frame::Frame, scramble};
+        let cfg = ModulationConfig {
+            mode: "BPSK250".into(),
+            ..ModulationConfig::default()
+        };
+        let (uncoded_wire, payload) = framed_wire(7);
+        let coded_wire = scramble::scrambled(
+            &FecCodec::new().encode(&Frame::new(7, payload.clone()).expect("frame").encode()),
+        );
+        let rs_decodes = |v: &[u8]| {
+            let mut w = v.to_vec();
+            scramble::scramble(&mut w);
+            FecCodec::new()
+                .decode_prefix(&w)
+                .ok()
+                .and_then(|d| Frame::decode(&d).ok())
+                .is_some_and(|f| f.payload == payload)
+        };
+        type Case<'a> = (&'a str, Vec<u8>, u8, &'a dyn Fn(&[u8]) -> bool);
+        let cases: [Case; 2] = [
+            ("uncoded", uncoded_wire, 0xB0, &|v| {
+                variant_decodes(v, &payload)
+            }),
+            ("Rs", coded_wire, 0xFF, &rs_decodes),
+        ];
+        for (name, wire, first, decodes) in cases {
+            assert_eq!(
+                wire[0], first,
+                "{name}: the production first wire byte changed"
+            );
+            let tx = crate::modulate::bpsk_modulate(&wire, &cfg).expect("modulate");
+            let mut slice = vec![0.0f32; 52]; // δ = 1.625 symbols at n = 32
+            slice.extend_from_slice(&tx);
+            let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+            let locks =
+                timing_locks_with_expected(&slice, 32, cfg.center_frequency, 8000.0, &expected);
+            assert!(
+                locks.widened < 0,
+                "{name}: the widened lock should sit on the −2-symbol alias here, got {locks:?}"
+            );
+            let variants = bpsk_demodulate_variants(&slice, &cfg).expect("variants");
+            assert_eq!(
+                variants.len(),
+                4,
+                "{name}: the locks differ, so both locks' arms are offered"
+            );
+            assert!(
+                !decodes(&variants[0]) && !decodes(&variants[1]),
+                "{name}: the widened lock decoded — this fixture no longer exercises the alias"
+            );
+            assert!(
+                variants[2..].iter().any(|v| decodes(v)),
+                "{name}: no restricted-lock arm decoded: the P6 rescue is not reaching the decoder"
+            );
+        }
+    }
+
+    /// #1438 PR2: where the widened and restricted timing locks DIFFER, the GPU path must pick the
+    /// same two locks and offer the same variants as the CPU path. Without this cell the second-lock
+    /// GPU path is exactly #1433's shape: a copy nobody's test reaches. In-crate (not in
+    /// `tests/gpu_cpu_equivalence.rs`) because its fixture guard needs the crate-private locks; that
+    /// file's `the_adapter_is_available_or_this_file_proves_nothing` still flags a host with no
+    /// adapter.
+    ///
+    /// Lead 0 (the widened lock is negative, so the GPU kernels' signed indexing and zero-read are
+    /// exercised) and lead 52 (1.625 symbols: the widened lock sits on the −2-symbol alias and the
+    /// restricted lock rescues). Noiselessly the variant vectors must be identical; under noise the
+    /// decode outcome must agree seed by seed.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_and_cpu_agree_where_the_two_timing_locks_differ() {
+        use openpulse_channel::{awgn::AwgnChannel, AwgnConfig, ChannelModel};
+        let Some(c) = openpulse_gpu::GpuContext::init() else {
+            eprintln!(
+                "no GPU adapter — gpu_and_cpu_agree_where_the_two_timing_locks_differ skipped"
+            );
+            return;
+        };
+        let cfg = ModulationConfig {
+            mode: "BPSK250".into(),
+            sample_rate: 8000,
+            center_frequency: 1500.0,
+            ..ModulationConfig::default()
+        };
+        let payload: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let frame = openpulse_core::frame::Frame::new(9, payload.clone())
+            .expect("frame")
+            .encode();
+        let tx = crate::modulate::bpsk_modulate(&openpulse_core::scramble::scrambled(&frame), &cfg)
+            .expect("modulate");
+        let decodes = |variants: &[Vec<u8>]| variants.iter().any(|v| variant_decodes(v, &payload));
+        for lead in [0usize, 52] {
+            let mut slice = vec![0.0f32; lead];
+            slice.extend_from_slice(&tx);
+            let locks = timing_locks_with_expected(
+                &slice,
+                32,
+                1500.0,
+                8000.0,
+                &expected_preamble_symbols(PREAMBLE_SYMS),
+            );
+            assert_ne!(
+                locks.widened, locks.restricted as isize,
+                "lead {lead}: the fixture must make the locks differ, or this cell proves nothing"
+            );
+            let cpu = bpsk_demodulate_variants(&slice, &cfg).expect("cpu");
+            let gpu = bpsk_demodulate_variants_with_gpu(&slice, &cfg, &c).expect("gpu");
+            assert_eq!(
+                cpu, gpu,
+                "lead {lead}: GPU and CPU variants differ on a NOISELESS slice"
+            );
+            let mut disagree = 0;
+            for seed in 0..8u64 {
+                let noisy = AwgnChannel::new(AwgnConfig::new(3.0, Some(40 + seed)))
+                    .expect("awgn")
+                    .apply(&slice);
+                let c_ok = decodes(&bpsk_demodulate_variants(&noisy, &cfg).expect("cpu"));
+                let g_ok =
+                    decodes(&bpsk_demodulate_variants_with_gpu(&noisy, &cfg, &c).expect("gpu"));
+                disagree += (c_ok != g_ok) as u32;
+            }
+            assert_eq!(
+                disagree, 0,
+                "lead {lead}: GPU and CPU decode outcomes disagree on {disagree}/8 seeds"
+            );
+        }
+    }
+
+    /// #1438 PR2's pre-registered measurement instrument (run on demand; asserts nothing).
+    ///
+    /// Per frame (one channel realisation, shared across every alignment) and per slice alignment
+    /// `δ ∈ [−0.75n, 2n]` in steps of n/8: coded (Rs, free-strengthened) decode of P0 — the restricted
+    /// `[0, n)` lock with both decision arms, i.e. BPSK before PR2 — against P6, the shipped
+    /// `bpsk_demodulate_variants`. Then the cost on PREAMBLE-FREE windows (noise only, frame length):
+    /// how often the two locks differ, and the per-attempt wall-clock of each policy.
+    ///
+    /// Two more columns measure the consumers that take ONE lock (the uncoded path, soft/HARQ):
+    /// the uncancelled arm (the soft path's sign slice) at the restricted lock (before PR2) against
+    /// the same arm at the widened lock (after). `UNCODED=1` sends bare frames, as the uncoded path
+    /// does. The noise-only windows are 1e-3 DC plus AWGN normalised to it; the mixer rejects the
+    /// DC.
+    ///
+    /// `RUNG=BPSK250 CH=awgn|fade SNR=-4 FRAMES=96 PAYLOAD=200 [UNCODED=1] cargo test --release
+    /// -p bpsk-plugin --no-default-features --lib two_lock_policy_measurement -- --ignored
+    /// --nocapture`
+    #[test]
+    #[ignore = "measurement instrument for #1438 PR2; run on demand; asserts nothing"]
+    fn two_lock_policy_measurement() {
+        use openpulse_channel::{
+            awgn::AwgnChannel, watterson::WattersonChannel, AwgnConfig, ChannelModel,
+            WattersonConfig,
+        };
+        use openpulse_core::{
+            fec::{free_rs_strengthening, FecCodec, FecMode},
+            frame::Frame,
+            scramble,
+        };
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let mode = env("RUNG", "BPSK250");
+        let ch = env("CH", "awgn");
+        let frames: u64 = env("FRAMES", "96").parse().expect("FRAMES");
+        let plen: usize = env("PAYLOAD", "200").parse().expect("PAYLOAD");
+        let snr: f32 = env("SNR", "-4").parse().expect("SNR");
+        let uncoded = env("UNCODED", "0") == "1";
+        let c = ModulationConfig {
+            mode: mode.clone(),
+            ..ModulationConfig::default()
+        };
+        let fs = c.sample_rate as f32;
+        let fc = c.center_frequency;
+        let n = samples_per_symbol(fs, parse_baud_rate(&mode).expect("baud")).expect("n");
+        let fec = if uncoded {
+            FecMode::None
+        } else {
+            free_rs_strengthening(FecMode::Rs, plen + Frame::WIRE_OVERHEAD)
+        };
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let decodes = |variants: &[Vec<u8>], payload: &[u8]| {
+            variants.iter().any(|b| {
+                let mut w = b.clone();
+                scramble::scramble(&mut w);
+                if uncoded {
+                    return Frame::decode(&w).is_ok_and(|f| f.payload == payload);
+                }
+                FecCodec::new()
+                    .decode_prefix(&w)
+                    .ok()
+                    .filter(|d| Frame::decode(d).is_ok())
+                    .or_else(|| FecCodec::strong().decode_prefix(&w).ok())
+                    .and_then(|d| Frame::decode(&d).ok())
+                    .is_some_and(|f| f.payload == payload)
+            })
+        };
+        let p0_variants = |x: &[f32]| -> Vec<Vec<u8>> {
+            let off = find_timing_offset_with_expected(x, n, fc, fs, &expected);
+            let (iv, qv) = demodulate_iq_at(x, n, fc, fs, off as isize);
+            variants_from_parts(iv, qv, true, PREAMBLE_SYMS).unwrap_or_default()
+        };
+        let base = 3 * n;
+        println!("\nTWOLOCK mode={mode} n={n} ch={ch} snr={snr} payload={plen}B fec={fec:?} frames={frames}");
+        let mut frame_len = 0usize;
+        for f in 0..frames {
+            let payload: Vec<u8> = (0..plen as u32)
+                .map(|i| ((i.wrapping_mul(2_654_435_761) >> 13) as u8) ^ (f as u8).wrapping_mul(31))
+                .collect();
+            let frame = Frame::new(f as u16, payload.clone())
+                .expect("frame")
+                .encode();
+            let coded = if uncoded {
+                frame
+            } else if fec == FecMode::RsStrong {
+                FecCodec::strong().encode(&frame)
+            } else {
+                FecCodec::new().encode(&frame)
+            };
+            let tx = crate::modulate::bpsk_modulate(&scramble::scrambled(&coded), &c).expect("mod");
+            frame_len = tx.len();
+            let mut b = vec![0.0f32; base];
+            b.extend_from_slice(&tx);
+            b.extend(std::iter::repeat_n(0.0, 2 * n));
+            let rx = if ch == "fade" {
+                let mut cfg = WattersonConfig::moderate_f1(Some(8100 + f));
+                cfg.snr_db = snr;
+                WattersonChannel::new(cfg).expect("w").apply(&b)
+            } else {
+                AwgnChannel::new(AwgnConfig::new(snr, Some(7700 + f)))
+                    .expect("a")
+                    .apply(&b)
+            };
+            let mut line = format!("TL {mode} {ch} {snr} {f}");
+            for e8 in -6i64..=16 {
+                let delta = e8 * n as i64 / 8;
+                let slice = &rx[(base as i64 - delta) as usize..];
+                let old = p0_variants(slice);
+                let new = bpsk_demodulate_variants(slice, &c).unwrap_or_default();
+                let p0 = decodes(&old, &payload);
+                let p6 = decodes(&new, &payload);
+                // The single-lock consumers: the uncancelled arm alone, old lock vs new.
+                let u0 = decodes(old.get(1..2).unwrap_or(&[]), &payload);
+                let u1 = decodes(new.get(1..2).unwrap_or(&[]), &payload);
+                line += &format!(" {e8}:{}{}{}{}", p0 as u8, p6 as u8, u0 as u8, u1 as u8);
+            }
+            println!("{line}");
+        }
+        // Cost on preamble-free windows: noise only, one frame long.
+        let windows = 24u64;
+        let (mut differ, mut t_p0, mut t_p6) = (0u32, 0f64, 0f64);
+        for w in 0..windows {
+            let noise = AwgnChannel::new(AwgnConfig::new(0.0, Some(5_000 + w)))
+                .expect("a")
+                .apply(&vec![1e-3f32; frame_len]);
+            let locks = timing_locks_with_expected(&noise, n, fc, fs, &expected);
+            differ += (locks.widened != locks.restricted as isize) as u32;
+            let t0 = std::time::Instant::now();
+            let a = p0_variants(&noise);
+            t_p0 += t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            let b = bpsk_demodulate_variants(&noise, &c).unwrap_or_default();
+            t_p6 += t1.elapsed().as_secs_f64();
+            std::hint::black_box((a, b));
+        }
+        println!(
+            "COST {mode} noise-only windows of {frame_len} samples: locks differ {differ}/{windows}; \
+             per attempt P0 {:.2} ms, P6 {:.2} ms (×{:.2})",
+            1e3 * t_p0 / windows as f64,
+            1e3 * t_p6 / windows as f64,
+            t_p6 / t_p0
+        );
+    }
+
+    /// When the two locks coincide the rescue adds nothing, and the trait bans duplicate variants:
+    /// exactly the two arms are offered.
+    #[test]
+    fn coinciding_locks_offer_each_arm_once() {
+        let cfg = ModulationConfig {
+            mode: "BPSK250".into(),
+            ..ModulationConfig::default()
+        };
+        let (wire, payload) = framed_wire(3);
+        let tx = crate::modulate::bpsk_modulate(&wire, &cfg).expect("modulate");
+        let mut slice = vec![0.0f32; 16]; // δ = n/2: the peak is inside both ranges
+        slice.extend_from_slice(&tx);
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let locks = timing_locks_with_expected(&slice, 32, cfg.center_frequency, 8000.0, &expected);
+        assert_eq!(
+            locks.widened, locks.restricted as isize,
+            "fixture: the locks should coincide"
+        );
+        let variants = bpsk_demodulate_variants(&slice, &cfg).expect("variants");
+        assert_eq!(
+            variants.len(),
+            2,
+            "coinciding locks must not duplicate the arms"
+        );
+        assert!(
+            variant_decodes(&variants[0], &payload),
+            "control: variant 0 decodes"
+        );
+    }
+
+    /// `estimate_snr_db` consumes the UNCANCELLED stream (#1438 PR1; it consumed the cancelled one
+    /// before, pinned by the test this replaces).
+    ///
+    /// The cancelled stream reads the channel only when the lock sits exactly on the symbol boundary;
+    /// at the quarter-symbol-early lock it read a near-constant (slope 0.09 dB/dB; ≈ 3 dB at −0.28n on
+    /// BPSK250). Asserted bit-for-bit against the stream-level estimator fed the raw parts, at an
+    /// early lock and 20 dB, with a control requiring the cancelled parts to read measurably
+    /// differently — otherwise a regression back to the cancelled stream could pass this vacuously.
+    #[test]
+    fn estimate_snr_db_reads_the_uncancelled_stream() {
+        let (tx, cfg) = snr_fixture();
+        let mut led = vec![0.0f32; 8];
+        led.extend_from_slice(&tx);
+        let rx = awgn(&led, 20.0, 11);
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let (raw_i, raw_q, crossfade) =
+            symbol_stream_parts_with_expected(&rx, &cfg, &expected).expect("parts");
+        assert!(
+            crossfade,
+            "BPSK250 is the crossfade path; the fixture is wrong"
+        );
+
+        let got = estimate_snr_db(&rx, &cfg).expect("estimate");
+        let want = snr_db_from_uncancelled_stream(&raw_i, &raw_q, &cfg).expect("uncancelled");
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "estimate_snr_db ({got}) no longer reads the uncancelled stream ({want})"
+        );
+
+        let (mut ci, mut cq) = (raw_i.clone(), raw_q.clone());
+        cancel_crossfade_isi(&mut ci, &mut cq);
+        let cancelled = snr_db_from_uncancelled_stream(&ci, &cq, &cfg).expect("cancelled");
+        assert!(
+            (cancelled - want).abs() > 1.0,
+            "control: the cancelled stream read {cancelled:.2} dB vs {want:.2} dB uncancelled — too \
+             close for the pin above to tell them apart"
+        );
+    }
+
+    /// #1438 PR1 criterion 1: the estimate reads the channel on AWGN at every sampling phase the
+    /// timing search lands on, on every BPSK rung, through a residual carrier offset up to the AFC's
+    /// 2 Hz deadband. **Forced phase** (the demod is run at a fixed offset from the true boundary), so
+    /// this measures the estimator, not the timing search — the search has its own baud/32 CFO null.
+    ///
+    /// Channel SNR is the ladder's scale (`openpulse_channel::AwgnChannel`, total power over the
+    /// buffer, whose lead-in and tail are ≲ 1 % of it). Tolerance ±1 dB at true 5 and 10 dB — the
+    /// ladder's BPSK decision region (ceilings 6–9 dB). At 20 dB the bound is one-sided (−2 … +1 dB):
+    /// a 1–2 Hz residual offset puts a floor under the reading (estimator output, channel scale:
+    /// ≈ 29.5 dB at 1 Hz, ≈ 27.5 dB at 2 Hz on BPSK31, 51 dB at 0 Hz). It is not the frequency
+    /// estimate — an exact derotation reads within 0.6 dB — but the reading still depends on the
+    /// window there, so the mechanism is not established. It reads up to 1.7 dB low at 20 dB. The inventory the constant was fitted to is
+    /// φ ∈ {−0.45, −0.33, −0.28, −0.16, −0.10} of a symbol.
+    #[test]
+    fn snr_estimate_tracks_awgn_at_every_early_phase() {
+        use openpulse_channel::{awgn::AwgnChannel, AwgnConfig, ChannelModel};
+        let payload: Vec<u8> = (0..48u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut worst = (0.0f32, String::new());
+        let mut misses: Vec<String> = Vec::new();
+        for mode in ["BPSK31", "BPSK63", "BPSK100", "BPSK250"] {
+            let c = ModulationConfig {
+                mode: mode.into(),
+                ..ModulationConfig::default()
+            };
+            let fs = c.sample_rate as f32;
+            let n = samples_per_symbol(fs, parse_baud_rate(mode).expect("baud")).expect("n");
+            for cfo in [0.0f32, 1.0, 2.0] {
+                let tx_cfg = ModulationConfig {
+                    center_frequency: c.center_frequency + cfo,
+                    ..c.clone()
+                };
+                let tx = crate::modulate::bpsk_modulate(&payload, &tx_cfg).expect("modulate");
+                let mut b = vec![0.0f32; n];
+                b.extend_from_slice(&tx);
+                b.extend(std::iter::repeat_n(0.0, 2 * n));
+                for true_snr in [5.0f32, 10.0, 20.0] {
+                    let seeds = 2u64;
+                    let rxs: Vec<Vec<f32>> = (0..seeds)
+                        .map(|sd| {
+                            AwgnChannel::new(AwgnConfig::new(true_snr, Some(40 + sd)))
+                                .expect("awgn")
+                                .apply(&b)
+                        })
+                        .collect();
+                    for frac in [-0.45f32, -0.33, -0.28, -0.16, -0.10] {
+                        let off = (n as f32 * (1.0 + frac)).round() as usize;
+                        let mut mean = 0.0f32;
+                        for rx in &rxs {
+                            let (iv, qv) = demodulate_iq(rx, n, c.center_frequency, fs, off);
+                            mean += snr_db_from_uncancelled_stream(&iv, &qv, &c).expect("est")
+                                / seeds as f32;
+                        }
+                        let err = mean - true_snr;
+                        if err.abs() > worst.0.abs() {
+                            worst = (
+                                err,
+                                format!("{mode} cfo {cfo} Hz true {true_snr} dB φ {frac}n"),
+                            );
+                        }
+                        // At 20 dB a residual offset's floor (≈ 27.5 dB post-constant on BPSK31 at 2 Hz;
+                        // not the frequency estimate, mechanism not established) costs up to ≈ 1.7 dB. That is far above every BPSK ceiling (6–9 dB), so there the bound is
+                        // one-sided: never high, at most 2 dB low.
+                        let miss = if true_snr >= 20.0 {
+                            !(-2.0..1.0).contains(&err)
+                        } else {
+                            err.abs() >= 1.0
+                        };
+                        if miss {
+                            misses.push(format!(
+                                "{mode}, residual {cfo} Hz, φ = {frac}n, true {true_snr} dB: read {mean:.2} dB"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        println!("worst error {:+.2} dB at {}", worst.0, worst.1);
+        assert!(
+            misses.is_empty(),
+            "{} cells outside ±1 dB:\n{}",
+            misses.len(),
+            misses.join("\n")
+        );
+    }
+
+    /// #1438 PR1 criterion 2: on a Watterson `moderate_f1` fade the BPSK250 estimate still MOVES with
+    /// the channel. The cancelled-stream estimator it replaced read a slope of 0.09 dB/dB here (a
+    /// constant); this test's own run of the uncancelled three-tap fit reads 0.68. The bar is 0.5.
+    /// The remaining shortfall is the channel's variation inside the 8-symbol window (reviewer
+    /// reasoning from the flat-fade and window-length controls, not a derived formula).
+    #[test]
+    fn snr_estimate_moves_with_snr_on_a_fade() {
+        use openpulse_channel::{watterson::WattersonChannel, ChannelModel, WattersonConfig};
+        let c = ModulationConfig {
+            mode: "BPSK250".into(),
+            ..ModulationConfig::default()
+        };
+        let fs = c.sample_rate as f32;
+        let n = 32usize;
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let tx = crate::modulate::bpsk_modulate(&payload, &c).expect("modulate");
+        let mut b = vec![0.0f32; n];
+        b.extend_from_slice(&tx);
+        b.extend(std::iter::repeat_n(0.0, 2 * n));
+        let off = (n as f32 * (1.0 - 0.28)).round() as usize;
+        let mean_at = |snr: f32| -> f32 {
+            let seeds = 16u64;
+            (0..seeds)
+                .map(|sd| {
+                    let mut cfg = WattersonConfig::moderate_f1(Some(900 + sd));
+                    cfg.snr_db = snr;
+                    let rx = WattersonChannel::new(cfg).expect("watterson").apply(&b);
+                    let (iv, qv) = demodulate_iq(&rx, n, c.center_frequency, fs, off);
+                    snr_db_from_uncancelled_stream(&iv, &qv, &c).expect("est")
+                })
+                .sum::<f32>()
+                / seeds as f32
+        };
+        let (lo, hi) = (mean_at(5.0), mean_at(20.0));
+        let slope = (hi - lo) / 15.0;
+        println!("moderate_f1 BPSK250: {lo:.2} dB at 5, {hi:.2} dB at 20, slope {slope:.2}");
+        assert!(
+            slope >= 0.5,
+            "on moderate_f1 the estimate moved only {slope:.2} dB per dB (5 → 20 dB: {lo:.2} → {hi:.2})"
+        );
+    }
+
+    /// The residual-frequency estimate uses decisions from the stream's own differential decode, so a
+    /// decision error flips ONE term of the phase-increment sum rather than every later one. Pinned by
+    /// injecting a single error mid-frame: the estimate must barely move.
+    #[test]
+    fn a_decision_error_moves_the_frequency_estimate_by_one_term() {
+        let (tx, cfg) = snr_fixture();
+        let shifted = ModulationConfig {
+            center_frequency: cfg.center_frequency + 2.0,
+            ..cfg.clone()
+        };
+        let payload: Vec<u8> = (0..120u32)
+            .map(|i| (i.wrapping_mul(97) >> 3) as u8)
+            .collect();
+        let tx2 = crate::modulate::bpsk_modulate(&payload, &shifted).expect("modulate");
+        let _ = tx;
+        let (iv, qv) = demodulate_iq(&tx2, 32, cfg.center_frequency, 8000.0, 0);
+        let rx: Vec<Complex32> = iv[PREAMBLE_SYMS - 1..iv.len() - TAIL_SYMS]
+            .iter()
+            .zip(&qv[PREAMBLE_SYMS - 1..qv.len() - TAIL_SYMS])
+            .map(|(&i, &q)| Complex32::new(i, q))
+            .collect();
+        let d = decisions_from_differential(&rx);
+        let w_clean = remove_residual_frequency(&mut rx.clone(), &d);
+        // One flipped differential bit: every decision after `k` changes sign.
+        let k = d.len() / 2;
+        let mut d_err = d.clone();
+        for x in d_err.iter_mut().skip(k) {
+            *x = -*x;
+        }
+        let w_err = remove_residual_frequency(&mut rx.clone(), &d_err);
+        let expected = std::f32::consts::TAU * 2.0 / 250.0;
+        assert!(
+            (w_clean - expected).abs() < 2e-3,
+            "2 Hz at 250 baud → {w_clean} rad/sym, want {expected}"
+        );
+        assert!(
+            (w_err - w_clean).abs() < 2e-3,
+            "one decision error moved the estimate {w_clean} → {w_err}: more than one term changed"
+        );
+    }
+
+    /// Deterministic AWGN at a given total-power SNR. Box-Muller over an LCG.
+    fn awgn(signal: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
+        let p: f32 = signal.iter().map(|s| s * s).sum::<f32>() / signal.len().max(1) as f32;
+        let sigma = (p / 10f32.powf(snr_db / 10.0)).sqrt();
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut u = || -> f32 {
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((st >> 11) as f32 / (1u64 << 53) as f32).clamp(1e-9, 1.0 - 1e-9)
+        };
+        signal
+            .iter()
+            .map(|&s| {
+                let (a, b) = (u(), u());
+                s + sigma * (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
+            })
+            .collect()
+    }
+
+    /// Variant 0 is byte-identical to `demodulate` — the trait contract hangs off `demodulate`.
+    #[test]
+    fn variant_zero_is_the_shipped_demodulate() {
+        let (tx, cfg) = snr_fixture();
+        for rx in [tx.clone(), awgn(&tx, 0.0, 7)] {
+            let variants = bpsk_demodulate_variants(&rx, &cfg).expect("variants");
+            let shipped = bpsk_demodulate(&rx, &cfg).expect("demodulate");
+            assert_eq!(variants[0], shipped, "variant 0 must BE the shipped decode");
+            assert_eq!(variants.len(), 2, "BPSK250 crossfades, so it has two arms");
+        }
+    }
+
+    /// The second arm must be a genuinely different decode — **on a noisy input**.
+    ///
+    /// On a CLEAN fixture the two arms are byte-identical: the crossfade bias is small against a
+    /// noiseless signal and flips no differential decision, so the union would cost an RS trial and
+    /// gain nothing. The arms diverge only where the union exists to help. A version of this test
+    /// written on the clean fixture failed for that reason, which is the useful form of the fact:
+    /// **an invariant about the two arms differing is only meaningful under noise.**
+    #[test]
+    fn the_second_arm_differs_from_the_first_under_noise() {
+        let (tx, cfg) = snr_fixture();
+        let clean = bpsk_demodulate_variants(&tx, &cfg).expect("variants");
+        assert_eq!(
+            clean[0], clean[1],
+            "documenting the boundary: noiseless, the arms agree"
+        );
+
+        let mut differing = 0;
+        for seed in 0..8u64 {
+            let v = bpsk_demodulate_variants(&awgn(&tx, 0.0, seed), &cfg).expect("variants");
+            if v[0] != v[1] {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing >= 4,
+            "only {differing}/8 noisy seeds separated the arms; the second arm is not \
+             contributing a distinct decode and the union cannot pay for itself"
+        );
+    }
+
     use crate::modulate::bytes_to_bits;
 
     #[test]
@@ -1715,5 +2751,1676 @@ mod carrier_dip_tiebreak {
         );
         println!("  the next bit also flips); soft symmetric. FALSIFIED if hard errors are NOT");
         println!("  concentrated on bit 0.\n");
+    }
+
+    /// Per-symbol `(e0, e1)` — the two Watterson rays as COMPLEX values, LABELLED, without
+    /// private access.
+    ///
+    /// `ray_envelopes` draws `env0` then `env1` from the seeded RNG BEFORE any noise sample and
+    /// reads neither `delay_spread_ms` nor `snr_db`, so one seed gives identical rays under any
+    /// delay. Two `apply_complex` calls then separate them:
+    ///
+    /// * delay 0, DC probe → `(e0 + e1)/√2`
+    /// * delay 1 ms, complex 1500 Hz tone, demixed → `(e0 − e1)/√2`, because 1500 Hz × 1 ms is 1.5
+    ///   cycles and `e^{−j3π} = −1`
+    ///
+    /// Sum and difference recover both. **Magnitudes alone are not enough** — `|e0+e1|` and
+    /// `|e0−e1|` give the power sum and the cross term, from which the rays come out at best as an
+    /// unlabelled pair. That mistake is why this measurement was recorded as impossible for a day.
+    ///
+    /// `the_ray_split_agrees_with_the_envelope` pins it against `carrier_envelope` in the default
+    /// run, so a silently wrong split cannot feed a table.
+    fn ray_split(
+        seed: u64,
+        len: usize,
+        n: usize,
+        offset: usize,
+    ) -> Vec<(num_complex::Complex<f32>, num_complex::Complex<f32>)> {
+        use num_complex::Complex;
+        let w = 2.0 * std::f32::consts::PI * FC / FS;
+        let ones = vec![1.0f32; len];
+        let zeros = vec![0.0f32; len];
+        let mut c0 = WattersonConfig::moderate_f1(Some(seed));
+        c0.snr_db = 200.0;
+        c0.delay_spread_ms = 0.0;
+        let (si, sq) = WattersonChannel::new(c0)
+            .expect("w")
+            .apply_complex(&ones, &zeros);
+        let pi_: Vec<f32> = (0..len).map(|k| (w * k as f32).cos()).collect();
+        let pq: Vec<f32> = (0..len).map(|k| (w * k as f32).sin()).collect();
+        let mut c1 = WattersonConfig::moderate_f1(Some(seed));
+        c1.snr_db = 200.0;
+        let (di, dq) = WattersonChannel::new(c1)
+            .expect("w")
+            .apply_complex(&pi_, &pq);
+        let mut out = Vec::new();
+        let mut start = offset;
+        while start + n <= len {
+            let (mut sum, mut dif) = (Complex::new(0.0f32, 0.0), Complex::new(0.0f32, 0.0));
+            for t in start..start + n {
+                sum += Complex::new(si[t], sq[t]);
+                dif += Complex::new(di[t], dq[t])
+                    * Complex::new((w * t as f32).cos(), -(w * t as f32).sin());
+            }
+            sum /= n as f32;
+            dif /= n as f32;
+            let e0 = (sum + dif) / std::f32::consts::SQRT_2;
+            let e1 = (sum - dif) / std::f32::consts::SQRT_2;
+            out.push((e0, e1));
+            start += n;
+        }
+        out
+    }
+
+    /// The split is only usable if it agrees with the instrument the tables already bin by, so this
+    /// runs in the DEFAULT suite rather than inside the `#[ignore]`d harness. `|e0 − e1|` is what a
+    /// carrier at `fc` sees through the 1 ms channel, which is exactly `carrier_envelope`.
+    #[test]
+    fn the_ray_split_agrees_with_the_envelope() {
+        let len = 40_000usize;
+        let n = samples_per_symbol(FS, BAUD).expect("sps");
+        // Through `ray_split` itself. A first version re-derived the demixed difference INLINE and
+        // compared that to `carrier_envelope` — which exercises the algebra but never the function
+        // the tables call, so a scaled demix inside the helper passed it. Sabotage-verified after
+        // the fix: `dif * 0.5` in the helper fails this.
+        let (mut worst, mut checked) = (0.0f32, 0usize);
+        for seed in 0..8u64 {
+            let env = carrier_envelope(seed, len, n, 0);
+            for (k, (e0, e1)) in ray_split(seed, len, n, 0).iter().enumerate().skip(1) {
+                if k >= env.len() {
+                    break;
+                }
+                // The 1 ms channel a carrier sees is e0 − e1 (1500 Hz x 1 ms = 1.5 cycles).
+                worst = worst.max((((*e0 - *e1) / std::f32::consts::SQRT_2).norm() - env[k]).abs());
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 5_000,
+            "only {checked} symbols compared — the sweep is too small to mean anything"
+        );
+        assert!(
+            worst < 0.02,
+            "the rays recovered by `ray_split` depart from `carrier_envelope` by {worst:.4} over \
+             {checked} symbols — the split is not measuring the channel the tables bin by"
+        );
+
+        // The rays are unit-mean-square **in the population**, not per seed: one frame is a single
+        // Rayleigh realisation and reads anywhere from ~0.7 to ~1.6, so asserting it per seed fails
+        // on seed 0 (1.561/0.747) — which this assertion caught before the claim shipped. What must
+        // hold is that NEITHER ray is systematically larger, or "delayed-dominant" is not a
+        // comparison between like quantities and every tap-split row is meaningless.
+        let (mut m0, mut m1) = (0.0f32, 0.0f32);
+        for seed in 0..8u64 {
+            let split = ray_split(seed, len, n, 0);
+            let tail = &split[1..];
+            m0 += tail.iter().map(|(a, _)| a.norm_sqr()).sum::<f32>() / tail.len() as f32;
+            m1 += tail.iter().map(|(_, b)| b.norm_sqr()).sum::<f32>() / tail.len() as f32;
+        }
+        m0 /= 8.0;
+        m1 /= 8.0;
+        assert!(
+            (m0 / m1 - 1.0).abs() < 0.30,
+            "mean ray powers {m0:.3}/{m1:.3} differ by more than 30% across 8 seeds, so one ray is \
+             systematically larger and `|e1| > |e0|` does not mean what the tap-split rows claim"
+        );
+    }
+
+    /// Transmitted symbols `a_k` reconstructed from the decoded truth stream, up to a global sign.
+    ///
+    /// The wire is differential: bit `i` is the flip between symbol `i` and `i+1`. The global sign
+    /// is unobservable and irrelevant — every quantity below is a ratio or a differential product.
+    fn symbols_from_truth(truth: &[bool]) -> Vec<f32> {
+        let mut a = Vec::with_capacity(truth.len() + 1);
+        a.push(1.0f32);
+        for &flip in truth {
+            let last = *a.last().expect("seeded");
+            a.push(if flip { -last } else { last });
+        }
+        a
+    }
+
+    /// Per-symbol composite taps by sliding-window CORRELATION — **the defective instrument,
+    /// retained as a control**, not the one to use. Prefer [`estimate_taps_ls`].
+    ///
+    /// Its "cross terms average out" premise fails on a real payload: 1/√41 ≈ 0.16 of relative
+    /// self-noise. Measured on a CLEAN frame with no channel, no noise and genie symbols, it puts
+    /// `Re(g_next/g_cur)` at p05 0.043 / p50 0.285 / p95 0.532 (truth: 0.308) and fires the sign
+    /// predicate **4.3 %** of the time against least-squares' 0.0 %. It is kept because the
+    /// comparison is itself the finding — it is what made a "genie" arm look like a floor rather
+    /// than a ceiling in the first #1363 gate table.
+    ///
+    /// `r_k = Σ_m g[m]·a_{k+m} + noise`, and `a_k ∈ {±1}` with `a² = 1`, so for a near-random symbol
+    /// stream `⟨r_k · a_{k+m}⟩` over a window estimates `g[m]` directly — the cross terms average
+    /// out. This is deliberately the same shape a receiver's decision-directed estimator would take,
+    /// which is the open question for any β-based fix: here it is fed GENIE symbols, so what it
+    /// measures is the ceiling, not an achievable estimate.
+    ///
+    /// Window 41 symbols: a 1 Hz fade at 250 baud has a coherence time of hundreds of symbols, so
+    /// the taps are ~constant across it, while 41 is long enough for the cross terms to average.
+    fn estimate_taps_correlation(
+        iq: &[(f32, f32)],
+        a: &[f32],
+        window: usize,
+    ) -> Vec<[num_complex::Complex<f32>; 4]> {
+        use num_complex::Complex;
+        let half = window / 2;
+        let n = iq.len().min(a.len());
+        let mut out = vec![[Complex::new(0.0f32, 0.0); 4]; n];
+        // Indexed on purpose: each step reads `iq[j]` against `a` at four different offsets, so an
+        // iterator over one of them would still index the others.
+        #[allow(clippy::needless_range_loop)]
+        for k in 0..n {
+            let lo = k.saturating_sub(half);
+            let hi = (k + half + 1).min(n);
+            let mut acc = [Complex::new(0.0f32, 0.0); 4];
+            let mut cnt = 0.0f32;
+            for j in lo..hi {
+                // m = -1, 0, +1, +2  ->  a index j + m
+                let idx = [j as isize - 1, j as isize, j as isize + 1, j as isize + 2];
+                if idx[0] < 0 || idx[3] >= n as isize {
+                    continue;
+                }
+                let r = Complex::new(iq[j].0, iq[j].1);
+                for (t, &ix) in idx.iter().enumerate() {
+                    acc[t] += r * a[ix as usize];
+                }
+                cnt += 1.0;
+            }
+            if cnt > 0.0 {
+                for t in 0..4 {
+                    out[k][t] = acc[t] / cnt;
+                }
+            }
+        }
+        out
+    }
+
+    /// Backward substitution with a PER-SYMBOL complex β — the generalisation of
+    /// `cancel_crossfade_isi`, which is this with `β ≡ 1/3` real.
+    ///
+    /// `the_variable_canceller_reproduces_the_shipped_one` pins that equivalence in the DEFAULT run,
+    /// so the alternative arms below are measured against the real transform rather than against a
+    /// re-implementation of it (CLAUDE.md verification rule 5).
+    fn cancel_variable(iq: &mut [(f32, f32)], beta: &[num_complex::Complex<f32>]) {
+        use num_complex::Complex;
+        let n = iq.len().min(beta.len());
+        for k in (0..n.saturating_sub(1)).rev() {
+            let next = Complex::new(iq[k + 1].0, iq[k + 1].1);
+            let cur = Complex::new(iq[k].0, iq[k].1) - beta[k] * next;
+            iq[k] = (cur.re, cur.im);
+        }
+    }
+
+    /// The variable-β canceller must BE the shipped one at β = 1/3, or every arm below is measured
+    /// against a re-implementation instead of the product.
+    #[test]
+    fn the_variable_canceller_reproduces_the_shipped_one() {
+        use num_complex::Complex;
+        let payload: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(11)).collect();
+        let c = cfg();
+        let tx = bpsk_modulate(&payload, &c).expect("modulate");
+        let n = samples_per_symbol(FS, BAUD).expect("sps");
+        let (mut iv, mut qv) = demodulate_iq(&tx, n, FC, FS, 0);
+        let mut mine: Vec<(f32, f32)> = iv.iter().copied().zip(qv.iter().copied()).collect();
+        cancel_crossfade_isi(&mut iv, &mut qv);
+        let betas = vec![Complex::new(CROSSFADE_ISI_BETA, 0.0); mine.len()];
+        cancel_variable(&mut mine, &betas);
+        let worst = mine
+            .iter()
+            .zip(iv.iter().zip(qv.iter()))
+            .map(|((mi, mq), (si, sq))| (mi - si).abs().max((mq - sq).abs()))
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "cancel_variable at beta=1/3 differs from cancel_crossfade_isi by {worst:e} — the \
+             alternative arms would be measured against a re-implementation, not the product"
+        );
+        assert!(mine.len() > 100, "fixture too short to mean anything");
+    }
+
+    /// (lock × dominance) — the slice #1363 named next, and the one that tells apart two
+    /// explanations the thread has been carrying side by side.
+    ///
+    /// The thread's claim is that the real variable is not which ray is larger in the ABSOLUTE
+    /// sense, but **where the timing lock sits relative to the dominant ray**. Those are not
+    /// separable from observational data: with one lock per frame and taps at 0 and 8 samples,
+    /// `rel = lock − tap` is nearly determined by dominance once the observed lock distribution is
+    /// fixed, so a cross-tab of found locks would look like a 2×2 while being collinear.
+    ///
+    /// So the lock is FORCED, and only to the two values that are physically meaningful — each ray's
+    /// own arrival. `n = 32` samples per symbol and 1 ms = 8 samples, so lock 0 samples aligned to
+    /// the direct ray and lock 8 aligned to the delayed one; both are a quarter-symbol apart, well
+    /// inside one symbol, so bit `i` still corresponds to transmitted bit `i` in both. That gives a
+    /// genuine 2×2 where alignment and dominance vary independently:
+    ///
+    /// | | direct dominant | delayed dominant |
+    /// |---|---|---|
+    /// | lock 0 | aligned | early by ¼ symbol |
+    /// | lock 8 | late by ¼ symbol | aligned |
+    ///
+    /// Noise-free and restricted to `|H| ∈ [0.05,0.20)`, because that is where the frames are
+    /// actually lost (the deep bin holds ~2.6 bits per frame) and because the noise-free row is the
+    /// one that showed the cost does not close at infinite SNR.
+    ///
+    ///   cargo test -p bpsk-plugin --no-default-features --lib \
+    ///       carrier_dip_tiebreak::measure_lock -- --ignored --nocapture
+    #[test]
+    #[ignore = "research harness: prints a table, asserts no threshold (#1363)"]
+    fn measure_lock_relative_to_dominant_tap() {
+        const SEEDS: u64 = 96;
+        const DELAY_SAMPLES: usize = 8; // 1 ms at 8 kHz, a quarter symbol at BPSK250
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let c = cfg();
+        let tx = bpsk_modulate(&payload, &c).expect("modulate");
+        let n = samples_per_symbol(FS, BAUD).expect("sps");
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let off0 = find_timing_offset_with_expected(&tx, n, FC, FS, &expected);
+        let truth = arm_bits(&tx, n, off0, false);
+
+        // [arm][lock 0|8][dominance 0=direct 1=delayed][bit]
+        let mut err = [[[[0u64; 2]; 2]; 2]; 2];
+        let mut tot = [[[[0u64; 2]; 2]; 2]; 2];
+
+        for seed in 0..SEEDS {
+            let mut ch = WattersonConfig::moderate_f1(Some(seed));
+            ch.snr_db = 200.0;
+            let faded = WattersonChannel::new(ch).expect("w").apply(&tx);
+            for (li, &lock) in [0usize, DELAY_SAMPLES].iter().enumerate() {
+                let env = carrier_envelope(seed, tx.len(), n, lock);
+                let rays = ray_split(seed, tx.len(), n, lock);
+                if env.is_empty() || rays.is_empty() {
+                    continue;
+                }
+                for (arm_i, cancel) in [(0usize, false), (1usize, true)] {
+                    let bits = arm_bits(&faded, n, lock, cancel);
+                    let m = bits.len().min(truth.len());
+                    for i in 0..m {
+                        let si = (i + 1).min(env.len() - 1);
+                        let d = env[si];
+                        if !(0.05..0.20).contains(&d) {
+                            continue;
+                        }
+                        let (e0, e1) = rays[si.min(rays.len() - 1)];
+                        let dom = usize::from(e1.norm() > e0.norm());
+                        let bit = usize::from(truth[i]);
+                        tot[arm_i][li][dom][bit] += 1;
+                        if bits[i] != truth[i] {
+                            err[arm_i][li][dom][bit] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("\nPROBE-1363-LOCK  moderate_f1, NOISE-FREE, {SEEDS} seeds, |H| in [0.05,0.20)");
+        println!("  lock is FORCED to each ray's own arrival, so alignment and dominance vary");
+        println!("  independently. lock 0 = direct ray's arrival; lock 8 = delayed ray's.\n");
+        println!(
+            "  lock | dominant | alignment        | soft b0/b1      | HARD b0/b1      |     n"
+        );
+        for li in 0..2 {
+            for dom in 0..2 {
+                let aligned = li == dom;
+                let label = if aligned {
+                    "aligned"
+                } else if li == 0 {
+                    "early by 1/4 sym"
+                } else {
+                    "late by 1/4 sym"
+                };
+                let r = |a: usize, bit: usize| {
+                    if tot[a][li][dom][bit] == 0 {
+                        f64::NAN
+                    } else {
+                        err[a][li][dom][bit] as f64 / tot[a][li][dom][bit] as f64
+                    }
+                };
+                println!(
+                    "  {:4} | {:8} | {:16} | {:6.3} / {:6.3} | {:6.3} / {:6.3} | {:5}",
+                    if li == 0 { 0 } else { DELAY_SAMPLES },
+                    if dom == 0 { "direct" } else { "delayed" },
+                    label,
+                    r(0, 0),
+                    r(0, 1),
+                    r(1, 0),
+                    r(1, 1),
+                    tot[0][li][dom][0] + tot[0][li][dom][1]
+                );
+            }
+        }
+        println!(
+            "\n  READ IT THIS WAY: if the thread is right that ALIGNMENT is the variable, the"
+        );
+        println!("  hard arm's penalty tracks the `aligned`/`early`/`late` column and not the");
+        println!(
+            "  `dominant` one. If instead the penalty follows `delayed` in BOTH lock rows, then"
+        );
+        println!("  absolute dominance is the variable and the lock is a bystander.\n");
+    }
+
+    /// The three measurements this thread named as outstanding, in one pass (#1363).
+    ///
+    /// 1. **An SNR axis** (16/24/32 dB and noise-free, same seeds) — the thread required it "before
+    ///    any claim about a graded onset", because at 16 dB symbol-domain noise (σ ≈ 0.039) is only
+    ///    1.4× the tie-break fill (β·g_next ≈ 0.053), so noise breaks the tie about as often as the
+    ///    recursion does.
+    /// 2. **Bytes, not bits** — RS(255,223) corrects t=16 BYTES, and the hard arm makes FEWER wrong
+    ///    bits while losing MORE frames. Counted on the payload-ALIGNED slice: grouping from
+    ///    differential bit 0 starts 31 bits before the payload's byte boundary and sweeps in
+    ///    preamble bytes, which moved the threshold count by two frames and produced a spurious
+    ///    "pinned at exactly 21".
+    /// 3. **Which tap dominates** — see `ray_split_powers`. This was called impossible once; it is
+    ///    not, and it turned out to be the measurement that located the harm.
+    ///
+    /// Prints tables, asserts no threshold. The assertions that make it trustworthy run in the
+    /// DEFAULT suite: the two fidelity tests above, plus `the_ray_split_agrees_with_the_envelope`.
+    ///
+    ///   cargo test -p bpsk-plugin --no-default-features --lib \
+    ///       carrier_dip_tiebreak::measure_snr_axis -- --ignored --nocapture
+    #[test]
+    #[ignore = "research harness: prints a table, asserts no threshold (#1363)"]
+    fn measure_snr_axis_tap_split_and_bytes() {
+        const SEEDS: u64 = 96;
+        const RS_T: usize = 16;
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let c = cfg();
+        let tx = bpsk_modulate(&payload, &c).expect("modulate");
+        let n = samples_per_symbol(FS, BAUD).expect("sps");
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let off0 = find_timing_offset_with_expected(&tx, n, FC, FS, &expected);
+        assert_eq!(off0, 0);
+        let truth = arm_bits(&tx, n, off0, false);
+        let truth_hard = arm_bits(&tx, n, off0, true);
+        assert_eq!(
+            (0..truth.len().min(truth_hard.len()))
+                .filter(|&i| truth[i] != truth_hard[i])
+                .count(),
+            0
+        );
+        let data_lo = PREAMBLE_SYMS - 1;
+        let data_hi = truth.len() - TAIL_SYMS;
+        let recovered = bits_to_bytes(&truth[data_lo..data_hi]);
+        assert_eq!(
+            &recovered[..],
+            &payload[..],
+            "aligned slice must reproduce the payload"
+        );
+        // distance from bit i (truth 0) to the next true flip
+        let mut dist = vec![usize::MAX; truth.len()];
+        let mut next = usize::MAX;
+        for i in (0..truth.len()).rev() {
+            if truth[i] {
+                next = i;
+            }
+            dist[i] = if next == usize::MAX { 99 } else { next - i };
+        }
+
+        // ---- per-seed: envelope (SNR independent), env0/env1 split, noise-free lock
+        struct SeedInfo {
+            env: Vec<f32>,
+            delayed_dom: Vec<bool>,
+            lock200: usize,
+            split_ok: bool,
+            p0: f32,
+            p1: f32,
+        }
+        let mut infos: Vec<SeedInfo> = Vec::new();
+        for seed in 0..SEEDS {
+            let mut ch = WattersonConfig::moderate_f1(Some(seed));
+            ch.snr_db = 200.0;
+            let faded = WattersonChannel::new(ch).expect("w").apply(&tx);
+            let lock200 = find_timing_offset_with_expected(&faded, n, FC, FS, &expected);
+            // The harness's own instrument, at the noise-free lock.
+            let env = carrier_envelope(seed, tx.len(), n, lock200);
+            // One implementation, the one `the_ray_split_agrees_with_the_envelope` pins.
+            let rays = ray_split(seed, tx.len(), n, lock200);
+            let mut delayed_dom = Vec::new();
+            let mut worst = 0.0f32;
+            let (mut p0, mut p1, mut cnt) = (0.0f32, 0.0f32, 0usize);
+            for (k, (e0, e1)) in rays.iter().enumerate() {
+                if k > 0 && k < env.len() {
+                    let d = (*e0 - *e1) / std::f32::consts::SQRT_2;
+                    worst = worst.max((d.norm() - env[k]).abs());
+                    p0 += e0.norm_sqr();
+                    p1 += e1.norm_sqr();
+                    cnt += 1;
+                }
+                delayed_dom.push(e1.norm() > e0.norm());
+            }
+            let split_ok = worst < 0.02;
+            infos.push(SeedInfo {
+                env,
+                delayed_dom,
+                lock200,
+                split_ok,
+                p0: p0 / cnt as f32,
+                p1: p1 / cnt as f32,
+            });
+        }
+        let bad_split = infos.iter().filter(|i| !i.split_ok).count();
+        let mp0 = infos.iter().map(|i| i.p0).sum::<f32>() / SEEDS as f32;
+        let mp1 = infos.iter().map(|i| i.p1).sum::<f32>() / SEEDS as f32;
+        println!("\nPROBE-1363-TAPS  env0/env1 split: seeds failing cross-check vs carrier_envelope (>0.02): {bad_split}/{SEEDS}; mean|e0|^2={mp0:.3} mean|e1|^2={mp1:.3}");
+        let dd: usize = infos
+            .iter()
+            .map(|i| i.delayed_dom.iter().filter(|&&b| b).count())
+            .sum();
+        let tt: usize = infos.iter().map(|i| i.delayed_dom.len()).sum();
+        println!(
+            "  delayed-ray dominant fraction of symbols: {:.3}",
+            dd as f64 / tt as f64
+        );
+        println!("  lock200 set: {:?}", {
+            let mut l: Vec<usize> = infos.iter().map(|i| i.lock200).collect();
+            l.sort();
+            l.dedup();
+            l
+        });
+
+        let fine = [0.0f32, 0.01, 0.02, 0.05];
+        for &snr in &[16.0f32, 24.0, 32.0, 200.0] {
+            for lockmode in 0..2 {
+                // [arm][bit][finebin]
+                let mut fe = [[[0u64; 3]; 2]; 2];
+                let mut ft = [[[0u64; 3]; 2]; 2];
+                // distance table deep(<0.05) b0: [arm][dbin 0..4]
+                let mut de = [[0u64; 4]; 2];
+                let mut dt = [[0u64; 4]; 2];
+                // dominant tap deep(<0.05): [arm][bit][dom]
+                let mut oe = [[[0u64; 2]; 2]; 2];
+                let mut ot = [[[0u64; 2]; 2]; 2];
+                // also mid bin [0.05,0.20) by dom
+                let mut me = [[[0u64; 2]; 2]; 2];
+                let mut mt = [[[0u64; 2]; 2]; 2];
+                let mut bad_al = [0u64; 2];
+                let mut bad_raw = [0u64; 2];
+                let mut lost_al = [Vec::<u64>::new(), Vec::new()];
+                let mut lost_raw = [0u64; 2];
+                let mut hist = [[0u64; 6]; 2];
+                let mut bits_wrong = [0u64; 2];
+                let mut lock_diff = 0usize;
+                let mut locks_noisy = Vec::new();
+                for seed in 0..SEEDS {
+                    let info = &infos[seed as usize];
+                    let mut ch = WattersonConfig::moderate_f1(Some(seed));
+                    ch.snr_db = snr;
+                    let faded = WattersonChannel::new(ch).expect("w").apply(&tx);
+                    let lock_n = find_timing_offset_with_expected(&faded, n, FC, FS, &expected);
+                    if lock_n != info.lock200 {
+                        lock_diff += 1;
+                    }
+                    locks_noisy.push(lock_n);
+                    let off = if lockmode == 0 { lock_n } else { info.lock200 };
+                    // envelope at the lock actually used
+                    let env = if off == info.lock200 {
+                        info.env.clone()
+                    } else {
+                        carrier_envelope(seed, tx.len(), n, off)
+                    };
+                    for (arm_i, cancel) in [(0usize, false), (1usize, true)] {
+                        let bits = arm_bits(&faded, n, off, cancel);
+                        let m = bits.len().min(truth.len());
+                        for i in 0..m {
+                            let si = (i + 1).min(env.len() - 1);
+                            let d = env[si];
+                            let wrong = bits[i] != truth[i];
+                            if wrong {
+                                bits_wrong[arm_i] += 1;
+                            }
+                            let bit = usize::from(truth[i]);
+                            let dom =
+                                usize::from(info.delayed_dom[si.min(info.delayed_dom.len() - 1)]);
+                            if d < 0.05 {
+                                let fb = if d < 0.01 {
+                                    0
+                                } else if d < 0.02 {
+                                    1
+                                } else {
+                                    2
+                                };
+                                ft[arm_i][bit][fb] += 1;
+                                if wrong {
+                                    fe[arm_i][bit][fb] += 1;
+                                }
+                                ot[arm_i][bit][dom] += 1;
+                                if wrong {
+                                    oe[arm_i][bit][dom] += 1;
+                                }
+                                if bit == 0 {
+                                    let db = (dist[i].min(4)) - 1;
+                                    dt[arm_i][db] += 1;
+                                    if wrong {
+                                        de[arm_i][db] += 1;
+                                    }
+                                }
+                            } else if d < 0.20 {
+                                mt[arm_i][bit][dom] += 1;
+                                if wrong {
+                                    me[arm_i][bit][dom] += 1;
+                                }
+                            }
+                        }
+                        // bytes, aligned to the payload
+                        let hi = data_hi.min(m);
+                        let got = bits_to_bytes(&bits[data_lo..hi]);
+                        let want = bits_to_bytes(&truth[data_lo..hi]);
+                        let nb = got.len().min(want.len());
+                        let bad = (0..nb).filter(|&j| got[j] != want[j]).count();
+                        bad_al[arm_i] += bad as u64;
+                        if bad > RS_T {
+                            lost_al[arm_i].push(seed);
+                        }
+                        let hb = match bad {
+                            0..=8 => 0,
+                            9..=12 => 1,
+                            13..=16 => 2,
+                            17..=20 => 3,
+                            21..=30 => 4,
+                            _ => 5,
+                        };
+                        hist[arm_i][hb] += 1;
+                        // bytes, the harness's grouping (from differential bit 0)
+                        let got = bits_to_bytes(&bits[..m]);
+                        let want = bits_to_bytes(&truth[..m]);
+                        let nb = got.len().min(want.len());
+                        let bad = (0..nb).filter(|&j| got[j] != want[j]).count();
+                        bad_raw[arm_i] += bad as u64;
+                        if bad > RS_T {
+                            lost_raw[arm_i] += 1;
+                        }
+                    }
+                }
+                let lm = if lockmode == 0 {
+                    "noisy-lock"
+                } else {
+                    "fixed-lock(200)"
+                };
+                println!("\n== snr {snr} [{lm}]  seeds whose noisy lock != lock200: {lock_diff}; noisy locks {:?}", { let mut l = locks_noisy.clone(); l.sort(); l.dedup(); l });
+                let r = |e: u64, t: u64| {
+                    if t == 0 {
+                        f64::NAN
+                    } else {
+                        e as f64 / t as f64
+                    }
+                };
+                println!("  fine deep bins   err|b0 (n)          err|b1 (n)");
+                for fb in 0..3 {
+                    for arm_i in 0..2 {
+                        println!(
+                            "   [{:.2},{:.2}) {}  {:.3} ({:4})   {:.3} ({:4})",
+                            fine[fb],
+                            fine[fb + 1],
+                            if arm_i == 0 { "soft" } else { "HARD" },
+                            r(fe[arm_i][0][fb], ft[arm_i][0][fb]),
+                            ft[arm_i][0][fb],
+                            r(fe[arm_i][1][fb], ft[arm_i][1][fb]),
+                            ft[arm_i][1][fb]
+                        );
+                    }
+                }
+                println!("  deep(<0.05) b0 err by distance to next true flip d=1,2,3,4+:");
+                for arm_i in 0..2 {
+                    println!(
+                        "   {}  {}",
+                        if arm_i == 0 { "soft" } else { "HARD" },
+                        (0..4)
+                            .map(|k| format!(
+                                "d{}={:.3}({})",
+                                k + 1,
+                                r(de[arm_i][k], dt[arm_i][k]),
+                                dt[arm_i][k]
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("  ")
+                    );
+                }
+                println!("  deep(<0.05) by dominant tap  [direct-dom b0/b1 | delayed-dom b0/b1]");
+                for arm_i in 0..2 {
+                    println!(
+                        "   {}  {:.3}/{:.3} (n {},{}) | {:.3}/{:.3} (n {},{})",
+                        if arm_i == 0 { "soft" } else { "HARD" },
+                        r(oe[arm_i][0][0], ot[arm_i][0][0]),
+                        r(oe[arm_i][1][0], ot[arm_i][1][0]),
+                        ot[arm_i][0][0],
+                        ot[arm_i][1][0],
+                        r(oe[arm_i][0][1], ot[arm_i][0][1]),
+                        r(oe[arm_i][1][1], ot[arm_i][1][1]),
+                        ot[arm_i][0][1],
+                        ot[arm_i][1][1]
+                    );
+                }
+                println!(
+                    "  mid [0.05,0.20) by dominant tap  [direct-dom b0/b1 | delayed-dom b0/b1]"
+                );
+                for arm_i in 0..2 {
+                    println!(
+                        "   {}  {:.3}/{:.3} (n {},{}) | {:.3}/{:.3} (n {},{})",
+                        if arm_i == 0 { "soft" } else { "HARD" },
+                        r(me[arm_i][0][0], mt[arm_i][0][0]),
+                        r(me[arm_i][1][0], mt[arm_i][1][0]),
+                        mt[arm_i][0][0],
+                        mt[arm_i][1][0],
+                        r(me[arm_i][0][1], mt[arm_i][0][1]),
+                        r(me[arm_i][1][1], mt[arm_i][1][1]),
+                        mt[arm_i][0][1],
+                        mt[arm_i][1][1]
+                    );
+                }
+                for arm_i in 0..2 {
+                    println!("  {}: wrong bits {}  bad bytes aligned {} (raw-grouping {})  lost>16 aligned {} (raw {})  hist[0-8,9-12,13-16,17-20,21-30,31+]={:?}",
+                        if arm_i==0 {"soft"} else {"HARD"}, bits_wrong[arm_i], bad_al[arm_i], bad_raw[arm_i], lost_al[arm_i].len(), lost_raw[arm_i], hist[arm_i]);
+                    println!("     lost seeds (aligned): {:?}", lost_al[arm_i]);
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════ REVIEW VARIANT (not for merge) ═══════════════════════
+    // Controls and off-band cells for the six gate arms. Reuses every helper above unchanged.
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 11
+    }
+
+    /// Fisher–Yates permutation of a fire mask: same count, positions randomised.
+    fn shuffle_mask(mask: &[bool], mut seed: u64) -> Vec<bool> {
+        let mut out = mask.to_vec();
+        for i in (1..out.len()).rev() {
+            let j = (lcg(&mut seed) % (i as u64 + 1)) as usize;
+            out.swap(i, j);
+        }
+        out
+    }
+
+    /// Shuffle WITHIN each stratum so the duty cycle is matched per cell, not per frame.
+    fn shuffle_stratified(mask: &[bool], seed: u64, strata: Option<&[u8]>) -> Vec<bool> {
+        let Some(st) = strata else {
+            return shuffle_mask(mask, seed);
+        };
+        let mut out = mask.to_vec();
+        for s in 0u8..3 {
+            let idx: Vec<usize> = (0..mask.len().min(st.len()))
+                .filter(|&k| st[k] == s)
+                .collect();
+            let sub: Vec<bool> = idx.iter().map(|&k| mask[k]).collect();
+            let sh = shuffle_mask(&sub, seed.wrapping_add(s as u64 * 999));
+            for (j, &k) in idx.iter().enumerate() {
+                out[k] = sh[j];
+            }
+        }
+        out
+    }
+
+    /// Windowed LEAST-SQUARES taps (4 unknowns, real regressors, complex observations). On a
+    /// noise-free frame this returns the exact composite taps; the correlation estimator does not,
+    /// because the payload's own a_k·a_{k+m} cross terms do not vanish over 41 symbols.
+    // Linear algebra over fixed 4x4 arrays: every loop indexes several parallel arrays at once, so
+    // the iterator rewrite clippy suggests does not apply.
+    #[allow(clippy::needless_range_loop)]
+    fn estimate_taps_ls(
+        iq: &[(f32, f32)],
+        a: &[f32],
+        window: usize,
+    ) -> Vec<[num_complex::Complex<f32>; 4]> {
+        use num_complex::Complex;
+        fn solve4(mut m: [[f64; 4]; 4], mut b: [f64; 4]) -> [f64; 4] {
+            for c in 0..4 {
+                let mut p = c;
+                for r in c + 1..4 {
+                    if m[r][c].abs() > m[p][c].abs() {
+                        p = r;
+                    }
+                }
+                m.swap(c, p);
+                b.swap(c, p);
+                let d = m[c][c];
+                if d.abs() < 1e-12 {
+                    return [0.0; 4];
+                }
+                for r in 0..4 {
+                    if r == c {
+                        continue;
+                    }
+                    let f = m[r][c] / d;
+                    for k in 0..4 {
+                        m[r][k] -= f * m[c][k];
+                    }
+                    b[r] -= f * b[c];
+                }
+            }
+            [
+                b[0] / m[0][0],
+                b[1] / m[1][1],
+                b[2] / m[2][2],
+                b[3] / m[3][3],
+            ]
+        }
+        let half = window / 2;
+        let n = iq.len().min(a.len());
+        let mut out = vec![[Complex::new(0.0f32, 0.0); 4]; n];
+        for k in 0..n {
+            let lo = k.saturating_sub(half);
+            let hi = (k + half + 1).min(n);
+            let mut xtx = [[0.0f64; 4]; 4];
+            let mut xtr = [0.0f64; 4];
+            let mut xti = [0.0f64; 4];
+            let mut cnt = 0usize;
+            for j in lo..hi {
+                if j < 1 || j + 2 >= n {
+                    continue;
+                }
+                let x = [
+                    a[j - 1] as f64,
+                    a[j] as f64,
+                    a[j + 1] as f64,
+                    a[j + 2] as f64,
+                ];
+                for p in 0..4 {
+                    for q in 0..4 {
+                        xtx[p][q] += x[p] * x[q];
+                    }
+                    xtr[p] += x[p] * iq[j].0 as f64;
+                    xti[p] += x[p] * iq[j].1 as f64;
+                }
+                cnt += 1;
+            }
+            if cnt < 8 {
+                continue;
+            }
+            for p in 0..4 {
+                xtx[p][p] += 1e-3 * cnt as f64;
+            } // ridge: the preamble's period-4 run is rank-deficient
+            let re = solve4(xtx, xtr);
+            let im = solve4(xtx, xti);
+            for t in 0..4 {
+                out[k][t] = Complex::new(re[t] as f32, im[t] as f32);
+            }
+        }
+        out
+    }
+
+    /// Least-squares taps by DEFAULT. Set `BPSK_TAPS_CORRELATION=1` to switch to the correlation
+    /// estimator instead — kept only so the instrument comparison stays reproducible, since the
+    /// difference between them flipped a conclusion in #1363 (a "genie" arm that was really a floor).
+    fn taps_for(
+        iq: &[(f32, f32)],
+        a: &[f32],
+        window: usize,
+    ) -> Vec<[num_complex::Complex<f32>; 4]> {
+        if std::env::var("BPSK_TAPS_CORRELATION").is_ok() {
+            estimate_taps_correlation(iq, a, window)
+        } else {
+            estimate_taps_ls(iq, a, window)
+        }
+    }
+
+    const ARMS: [&str; 9] = [
+        "soft",
+        "hard",
+        "thread",
+        "sign",
+        "beta",
+        "sign_dd",
+        "beta_dd",
+        "sign_shuf",
+        "sdd_shuf",
+    ];
+
+    /// Per-arm β vectors plus the two fire masks (genie sign, dd sign) for a frame.
+    #[allow(clippy::type_complexity)]
+    fn build_betas(
+        base: &[(f32, f32)],
+        a_genie: &[f32],
+        window: usize,
+        shuffle_seed: u64,
+        strata: Option<&[u8]>,
+    ) -> (Vec<Vec<num_complex::Complex<f32>>>, Vec<bool>, Vec<bool>) {
+        use num_complex::Complex;
+        let m = base.len();
+        let taps = taps_for(base, a_genie, window);
+        let soft_bits = differential_decode(base);
+        let a_dd = symbols_from_truth(&soft_bits);
+        let taps_dd = taps_for(base, &a_dd, window);
+        let b0 = Complex::new(0.0f32, 0.0);
+        let bh = Complex::new(CROSSFADE_ISI_BETA, 0.0);
+        let mut betas: Vec<Vec<Complex<f32>>> = vec![
+            vec![b0; m],
+            vec![bh; m],
+            vec![bh; m],
+            vec![bh; m],
+            vec![b0; m],
+            vec![bh; m],
+            vec![b0; m],
+            vec![bh; m],
+            vec![bh; m],
+        ];
+        let mut sign_mask = vec![false; m];
+        let mut sdd_mask = vec![false; m];
+        for k in 0..m.min(taps.len()).min(taps_dd.len()) {
+            let (gc, gn) = (taps[k][1], taps[k][2]);
+            if gc.norm() < gn.norm() {
+                betas[2][k] = b0;
+            }
+            if (gn * gc.conj()).re < 0.0 {
+                betas[3][k] = b0;
+                sign_mask[k] = true;
+            }
+            if gc.norm() > 1e-9 {
+                let be = gn / gc;
+                if be.norm() < 1.0 {
+                    betas[4][k] = be;
+                }
+            }
+            let (dc, dn) = (taps_dd[k][1], taps_dd[k][2]);
+            if (dn * dc.conj()).re < 0.0 {
+                betas[5][k] = b0;
+                sdd_mask[k] = true;
+            }
+            if dc.norm() > 1e-9 {
+                let be = dn / dc;
+                if be.norm() < 1.0 {
+                    betas[6][k] = be;
+                }
+            }
+        }
+        let sh = shuffle_stratified(&sign_mask, shuffle_seed ^ 0xA5A5, strata);
+        let sdh = shuffle_stratified(&sdd_mask, shuffle_seed ^ 0x5A5A, strata);
+        for k in 0..m {
+            if sh[k] {
+                betas[7][k] = b0;
+            }
+            if sdh[k] {
+                betas[8][k] = b0;
+            }
+        }
+        (betas, sign_mask, sdd_mask)
+    }
+
+    fn bad_bytes(bits: &[bool], truth: &[bool], lo: usize, hi: usize) -> (usize, usize) {
+        let hi = hi.min(bits.len()).min(truth.len());
+        let got = bits_to_bytes(&bits[lo..hi]);
+        let want = bits_to_bytes(&truth[lo..hi]);
+        let bad = got.iter().zip(want.iter()).filter(|(g, w)| g != w).count();
+        let wrong_bits = (lo..hi).filter(|&i| bits[i] != truth[i]).count();
+        (bad, wrong_bits)
+    }
+
+    fn pct(num: u64, den: u64) -> f64 {
+        if den == 0 {
+            f64::NAN
+        } else {
+            100.0 * num as f64 / den as f64
+        }
+    }
+
+    ///   cargo test -p bpsk-plugin --no-default-features --lib --release \
+    ///       carrier_dip_tiebreak::review_gates -- --ignored --nocapture
+    #[test]
+    #[ignore = "review harness"]
+    fn measure_gates_controls_and_off_band() {
+        use openpulse_channel::awgn::AwgnChannel;
+        use openpulse_channel::AwgnConfig;
+        const SEEDS: u64 = 96;
+        const DELAY: usize = 8;
+        const WINDOW: usize = 41;
+        const RS_T: usize = 16;
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let c = cfg();
+        let tx = bpsk_modulate(&payload, &c).expect("modulate");
+        let n = samples_per_symbol(FS, BAUD).expect("sps");
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let off0 = find_timing_offset_with_expected(&tx, n, FC, FS, &expected);
+        assert_eq!(off0, 0);
+        let truth = arm_bits(&tx, n, off0, false);
+        let a = symbols_from_truth(&truth);
+        let data_lo = PREAMBLE_SYMS - 1;
+        let data_hi = truth.len() - TAIL_SYMS;
+        assert_eq!(bits_to_bytes(&truth[data_lo..data_hi]), payload);
+        let tx_rms = (tx.iter().map(|s| s * s).sum::<f32>() / tx.len() as f32).sqrt();
+        println!(
+            "\nPROBE-1363  estimator = {}",
+            // Read the SAME switch `taps_for` reads. A label that can disagree with the
+            // instrument it names is the defect this whole probe exists to catch.
+            if std::env::var("BPSK_TAPS_CORRELATION").is_ok() {
+                "CORRELATION (the defective control)"
+            } else {
+                "LEAST-SQUARES (default)"
+            }
+        );
+        println!("PROBE-1363  tx rms {tx_rms:.4}; #821's sigma 0.9 is {:.1} dB in this crate's SNR convention",
+            20.0 * (tx_rms / 0.9).log10());
+
+        // ── Part 0: estimator control on the CLEAN frame ─────────────────────────────────
+        {
+            let (iv, qv) = demodulate_iq(&tx, n, FC, FS, 0);
+            let base: Vec<(f32, f32)> = iv.iter().copied().zip(qv.iter().copied()).collect();
+            let (_, sm, sdm) = build_betas(&base, &a, WINDOW, 1, None);
+            let taps = taps_for(&base, &a, WINDOW);
+            let lo = data_lo + WINDOW;
+            let hi = data_hi.saturating_sub(WINDOW);
+            let mut ratios: Vec<f32> = (lo..hi).map(|k| (taps[k][2] / taps[k][1]).re).collect();
+            ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let q = |p: f64| ratios[((ratios.len() - 1) as f64 * p) as usize];
+            let thread_f = (lo..hi)
+                .filter(|&k| taps[k][1].norm() < taps[k][2].norm())
+                .count();
+            let sign_f = (lo..hi).filter(|&k| sm[k]).count();
+            let sdd_f = (lo..hi).filter(|&k| sdm[k]).count();
+            let mut prev: Vec<f32> = (lo..hi).map(|k| (taps[k][0] / taps[k][1]).norm()).collect();
+            prev.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            println!(
+                "PART 0  clean frame, genie taps, data region only (n={}):",
+                hi - lo
+            );
+            println!(
+                "  Re(g_next/g_cur)  p05 {:.3}  p50 {:.3}  p95 {:.3}   (shipped beta = 0.333)",
+                q(0.05),
+                q(0.5),
+                q(0.95)
+            );
+            println!(
+                "  |g_prev/g_cur|    p50 {:.3}  p95 {:.3}",
+                prev[prev.len() / 2],
+                prev[(prev.len() - 1) * 95 / 100]
+            );
+            println!("  thread fires {:.1}%   sign fires {:.1}%   sign_dd fires {:.1}%  (any non-zero here is estimator self-noise)",
+                pct(thread_f as u64, (hi - lo) as u64), pct(sign_f as u64, (hi - lo) as u64), pct(sdd_f as u64, (hi - lo) as u64));
+        }
+
+        // ── Part A: noise-free 1 ms, forced lock, band [0.05,0.20), 9 arms ───────────────
+        {
+            let mut err = vec![[[[0u64; 2]; 2]; 2]; 9];
+            let mut tot = vec![[[[0u64; 2]; 2]; 2]; 9];
+            // per-seed, lock 0, delayed-dominant cell: paired error counts
+            let mut per_seed: Vec<[u64; 9]> = Vec::new();
+            let mut fire_sign = [[0u64; 2]; 2];
+            let mut fire_sdd = [[0u64; 2]; 2];
+            let mut fire_thr = [[0u64; 2]; 2];
+            let mut seen = [[0u64; 2]; 2];
+            // frame-level at the FOUND (noise-free) lock
+            let mut lost = [0u64; 9];
+            let mut lost_seeds: Vec<Vec<u64>> = vec![Vec::new(); 9];
+            let mut lock_hist = std::collections::BTreeMap::new();
+            for seed in 0..SEEDS {
+                let mut ch = WattersonConfig::moderate_f1(Some(seed));
+                ch.snr_db = 200.0;
+                let faded = WattersonChannel::new(ch).expect("w").apply(&tx);
+                let found = find_timing_offset_with_expected(&faded, n, FC, FS, &expected);
+                *lock_hist.entry(found).or_insert(0u64) += 1;
+                {
+                    let (iv, qv) = demodulate_iq(&faded, n, FC, FS, found);
+                    let base: Vec<(f32, f32)> =
+                        iv.iter().copied().zip(qv.iter().copied()).collect();
+                    let (betas, _, _) = build_betas(&base, &a, WINDOW, seed + 1000, None);
+                    for (ai, bet) in betas.iter().enumerate() {
+                        let mut iq = base.clone();
+                        cancel_variable(&mut iq, bet);
+                        let bits = differential_decode(&iq);
+                        let (bad, _) = bad_bytes(&bits, &truth, data_lo, data_hi);
+                        if bad > RS_T {
+                            lost[ai] += 1;
+                            lost_seeds[ai].push(seed);
+                        }
+                    }
+                }
+                let mut row = [0u64; 9];
+                for (li, &lock) in [0usize, DELAY].iter().enumerate() {
+                    let env = carrier_envelope(seed, tx.len(), n, lock);
+                    let rays = ray_split(seed, tx.len(), n, lock);
+                    if env.is_empty() || rays.is_empty() {
+                        continue;
+                    }
+                    let (iv, qv) = demodulate_iq(&faded, n, FC, FS, lock);
+                    let base: Vec<(f32, f32)> =
+                        iv.iter().copied().zip(qv.iter().copied()).collect();
+                    let strata: Vec<u8> = (0..base.len())
+                        .map(|k| {
+                            let d = env[k.min(env.len() - 1)];
+                            if (0.05..0.20).contains(&d) {
+                                let (e0, e1) = rays[k.min(rays.len() - 1)];
+                                1 + u8::from(e1.norm() > e0.norm())
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    let (betas, sm, sdm) =
+                        build_betas(&base, &a, WINDOW, seed * 7 + li as u64, Some(&strata));
+                    let tg = taps_for(&base, &a, WINDOW);
+                    for (ai, bet) in betas.iter().enumerate() {
+                        let mut iq = base.clone();
+                        cancel_variable(&mut iq, bet);
+                        let bits = differential_decode(&iq);
+                        let lim = bits.len().min(truth.len());
+                        for i in 0..lim {
+                            let si = (i + 1).min(env.len() - 1);
+                            let d = env[si];
+                            if !(0.05..0.20).contains(&d) {
+                                continue;
+                            }
+                            let (e0, e1) = rays[si.min(rays.len() - 1)];
+                            let dom = usize::from(e1.norm() > e0.norm());
+                            let bit = usize::from(truth[i]);
+                            tot[ai][li][dom][bit] += 1;
+                            let wrong = bits[i] != truth[i];
+                            if wrong {
+                                err[ai][li][dom][bit] += 1;
+                                if li == 0 && dom == 1 {
+                                    row[ai] += 1;
+                                }
+                            }
+                            if ai == 0 {
+                                seen[li][dom] += 1;
+                                let kk = si.min(sm.len() - 1);
+                                if sm[kk] {
+                                    fire_sign[li][dom] += 1;
+                                }
+                                if sdm[kk] {
+                                    fire_sdd[li][dom] += 1;
+                                }
+                                if tg[kk][1].norm() < tg[kk][2].norm() {
+                                    fire_thr[li][dom] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                per_seed.push(row);
+            }
+            println!("\nPART A  noise-free, 1 ms, forced lock, |H| in [0.05,0.20), {SEEDS} seeds — err b0/b1");
+            print!("  lock | dominant ");
+            for arm in ARMS {
+                print!("| {arm:>11} ");
+            }
+            println!("| sign fires | sdd fires | thread fires");
+            for li in 0..2 {
+                for dom in 0..2 {
+                    print!(
+                        "  {:4} | {:8} ",
+                        if li == 0 { 0 } else { DELAY },
+                        if dom == 0 { "direct" } else { "delayed" }
+                    );
+                    for ai in 0..9 {
+                        let r = |b: usize| {
+                            if tot[ai][li][dom][b] == 0 {
+                                f64::NAN
+                            } else {
+                                err[ai][li][dom][b] as f64 / tot[ai][li][dom][b] as f64
+                            }
+                        };
+                        print!("| {:5.3}/{:5.3} ", r(0), r(1));
+                    }
+                    println!(
+                        "|     {:5.1}% |   {:5.1}% |   {:5.1}%",
+                        pct(fire_sign[li][dom], seen[li][dom]),
+                        pct(fire_sdd[li][dom], seen[li][dom]),
+                        pct(fire_thr[li][dom], seen[li][dom])
+                    );
+                }
+            }
+            // paired per-seed comparisons in the product cell (lock 0, delayed)
+            let pair = |x: usize, y: usize| {
+                let (mut fewer, mut equal, mut more, mut nz) = (0, 0, 0, 0);
+                for r in &per_seed {
+                    if r[x] + r[y] == 0 {
+                        continue;
+                    }
+                    nz += 1;
+                    match r[x].cmp(&r[y]) {
+                        std::cmp::Ordering::Less => fewer += 1,
+                        std::cmp::Ordering::Equal => equal += 1,
+                        _ => more += 1,
+                    }
+                }
+                format!(
+                    "{} fewer / {} equal / {} more (of {} seeds with any error)",
+                    fewer, equal, more, nz
+                )
+            };
+            println!("\n  PAIRED per seed, lock 0 / delayed cell, errors(X) vs errors(Y):");
+            println!("    sign_dd vs hard : {}", pair(5, 1));
+            println!("    sign    vs soft : {}", pair(3, 0));
+            println!("    sign_dd vs soft : {}", pair(5, 0));
+            println!("    sign vs sign_shuf: {}", pair(3, 7));
+            println!("    sign_dd vs sdd_shuf: {}", pair(5, 8));
+            println!("\n  FRAME LEVEL at the found noise-free lock (lock hist {:?}) — lost = >{} bad payload bytes of 200:", lock_hist, RS_T);
+            for ai in 0..9 {
+                println!(
+                    "    {:>9}: lost {:2}   seeds {:?}",
+                    ARMS[ai], lost[ai], lost_seeds[ai]
+                );
+            }
+        }
+
+        // ── Part B: WITH NOISE, found lock, frame level ──────────────────────────────────
+        println!("\nPART B  with noise, found lock per frame, {SEEDS} seeds; lost = >{RS_T} bad payload bytes; wrong bits over the payload");
+        let cells: [(&str, f32); 12] = [
+            ("moderate_f1 1ms", 8.0),
+            ("moderate_f1 1ms", 12.0),
+            ("moderate_f1 1ms", 16.0),
+            ("doppler-only 0ms", 8.0),
+            ("doppler-only 0ms", 12.0),
+            ("awgn", -2.0),
+            ("awgn", -1.0),
+            ("awgn", 0.0),
+            ("awgn", 2.0),
+            ("awgn", 5.0),
+            ("awgn", 8.0),
+            ("awgn sigma0.9", 20.0 * (tx_rms / 0.9).log10()),
+        ];
+        for (name, snr) in cells {
+            let mut lost = [0u64; 9];
+            let mut wrong = [0u64; 9];
+            let mut badb = [0u64; 9];
+            let (mut f_sign, mut f_sdd, mut n_sym) = (0u64, 0u64, 0u64);
+            for seed in 0..SEEDS {
+                let faded: Vec<f32> = match name {
+                    "moderate_f1 1ms" => {
+                        let mut ch = WattersonConfig::moderate_f1(Some(seed));
+                        ch.snr_db = snr;
+                        WattersonChannel::new(ch).expect("w").apply(&tx)
+                    }
+                    "doppler-only 0ms" => {
+                        let mut ch = WattersonConfig::moderate_f1(Some(seed));
+                        ch.snr_db = snr;
+                        ch.delay_spread_ms = 0.0;
+                        WattersonChannel::new(ch).expect("w").apply(&tx)
+                    }
+                    _ => AwgnChannel::new(AwgnConfig::new(snr, Some(seed)))
+                        .expect("awgn")
+                        .apply(&tx),
+                };
+                let found = find_timing_offset_with_expected(&faded, n, FC, FS, &expected);
+                let (iv, qv) = demodulate_iq(&faded, n, FC, FS, found);
+                let base: Vec<(f32, f32)> = iv.iter().copied().zip(qv.iter().copied()).collect();
+                let (betas, sm, sdm) = build_betas(&base, &a, WINDOW, seed + 77, None);
+                for k in data_lo..data_hi.min(sm.len()) {
+                    n_sym += 1;
+                    if sm[k] {
+                        f_sign += 1;
+                    }
+                    if sdm[k] {
+                        f_sdd += 1;
+                    }
+                }
+                for (ai, bet) in betas.iter().enumerate() {
+                    let mut iq = base.clone();
+                    cancel_variable(&mut iq, bet);
+                    let bits = differential_decode(&iq);
+                    let (bad, wb) = bad_bytes(&bits, &truth, data_lo, data_hi);
+                    wrong[ai] += wb as u64;
+                    badb[ai] += bad as u64;
+                    if bad > RS_T {
+                        lost[ai] += 1;
+                    }
+                }
+            }
+            println!(
+                "\n  {name} @ {snr:.1} dB   sign fires {:.1}%  sign_dd fires {:.1}% (data region)",
+                pct(f_sign, n_sym),
+                pct(f_sdd, n_sym)
+            );
+            print!("    lost  :");
+            for ai in 0..9 {
+                print!(" {}={:<3}", ARMS[ai], lost[ai]);
+            }
+            println!();
+            print!("    badB  :");
+            for ai in 0..9 {
+                print!(" {}={:<5}", ARMS[ai], badb[ai]);
+            }
+            println!();
+            print!("    wrongb:");
+            for ai in 0..9 {
+                print!(" {}={:<6}", ARMS[ai], wrong[ai]);
+            }
+            println!();
+        }
+    }
+}
+
+#[cfg(test)]
+mod snr_decision_discriminator {
+    //! #1435 — does BPSK's SNR estimate read low BECAUSE of the decisions it is fed?
+    //!
+    //! One received span, two decision sequences: SHIPPED (the cancelled stream's differential
+    //! decisions, integrated exactly as `estimate_snr_db` does) and ORACLE (the true transmitted
+    //! symbols). Holding the span fixed removes the confound that left #1435's paired measurement
+    //! unable to separate "different onset" from "different decisions".
+    //!
+    //! Pre-registered. If #1435's mechanism is right: identical estimates when no decision is wrong;
+    //! SHIPPED falls below ORACLE as decision errors appear, driven by windows that hold a sign
+    //! DISCONTINUITY rather than by paired errors. **Falsifier:** SHIPPED ≈ ORACLE despite many
+    //! decision errors — then the bias #1435 measured comes from somewhere other than the decisions.
+    //!
+    //! `additive_snr_db_windowed` already documents that it "saturates once symbol errors are common"
+    //! — this measures how much, and whether that is the whole story.
+    use super::*;
+    use crate::modulate::{bytes_to_bits, preamble_bits};
+    use openpulse_channel::{
+        awgn::AwgnChannel, watterson::WattersonChannel, AwgnConfig, ChannelModel, WattersonConfig,
+    };
+    use openpulse_dsp::constellation::additive_snr_db_windowed;
+
+    /// Must equal `estimate_snr_db`'s; the fidelity assertion below fails if it does not.
+    const WINDOW_SYMS: usize = 16;
+
+    fn cfg() -> ModulationConfig {
+        ModulationConfig {
+            mode: "BPSK250".to_string(),
+            sample_rate: 8000,
+            center_frequency: 1500.0,
+            pulse_shape: PulseShape::Hann,
+            ..Default::default()
+        }
+    }
+
+    /// The transmitted symbols. This re-derives the modulator's bit layout, so it is NOT trusted:
+    /// the clean-channel control below requires it to agree with the shipped decisions on every
+    /// symbol, which fails if it is misaligned or wrong.
+    fn truth(payload: &[u8]) -> Vec<f32> {
+        let mut bits = preamble_bits(PREAMBLE_SYMS);
+        bits.extend(bytes_to_bits(payload));
+        bits.extend(std::iter::repeat_n(false, TAIL_SYMS));
+        nrzi_encode(&bits)
+            .iter()
+            .map(|&neg| if neg { -1.0 } else { 1.0 })
+            .collect()
+    }
+
+    struct Row {
+        shipped: f32,
+        oracle: f32,
+        product: f32,
+        diff_errs: usize,
+        paired: usize,
+        damaged_windows: usize,
+        windows: usize,
+    }
+
+    fn measure(audio: &[f32], truth: &[f32]) -> Option<Row> {
+        let c = cfg();
+        let (i_s, q_s) = symbol_stream(audio, &c).ok()?;
+        let range_start = PREAMBLE_SYMS - 1;
+        let end = i_s.len().checked_sub(TAIL_SYMS)?;
+        if range_start >= end {
+            return None;
+        }
+        let rx: Vec<Complex32> = (range_start..end)
+            .map(|k| Complex32::new(i_s[k], q_s[k]))
+            .collect();
+        let iq: Vec<(f32, f32)> = rx.iter().map(|z| (z.re, z.im)).collect();
+        let bits = differential_decode(&iq);
+        let mut shipped = Vec::with_capacity(rx.len());
+        let mut cur = Complex32::new(1.0, 0.0);
+        shipped.push(cur);
+        for &flip in &bits {
+            if flip {
+                cur = -cur;
+            }
+            shipped.push(cur);
+        }
+        let oracle: Vec<Complex32> = truth
+            .get(range_start..end)?
+            .iter()
+            .map(|&s| Complex32::new(s, 0.0))
+            .collect();
+        if oracle.len() != rx.len() {
+            return None;
+        }
+        let tbits: Vec<bool> = oracle.windows(2).map(|w| w[1].re * w[0].re < 0.0).collect();
+        let err: Vec<bool> = bits.iter().zip(&tbits).map(|(a, b)| a != b).collect();
+        let diff_errs = err.iter().filter(|e| **e).count();
+        let mut paired = 0;
+        let mut k = 0;
+        while k + 1 < err.len() {
+            if err[k] && err[k + 1] {
+                paired += 1;
+                k += 2;
+            } else {
+                k += 1;
+            }
+        }
+        // A window is damaged when the shipped sequence changes sign against the truth INSIDE it;
+        // a whole-window inversion is absorbed by that window's own LS gain and does no harm.
+        let agree: Vec<bool> = shipped
+            .iter()
+            .zip(&oracle)
+            .map(|(s, o)| s.re * o.re > 0.0)
+            .collect();
+        let (mut damaged_windows, mut windows, mut start) = (0, 0, 0);
+        while start < agree.len() {
+            let stop = (start + WINDOW_SYMS).min(agree.len());
+            windows += 1;
+            if agree[start..stop].iter().any(|a| *a != agree[start]) {
+                damaged_windows += 1;
+            }
+            start = stop;
+        }
+        Some(Row {
+            shipped: additive_snr_db_windowed(&rx, &shipped, WINDOW_SYMS),
+            oracle: additive_snr_db_windowed(&rx, &oracle, WINDOW_SYMS),
+            product: estimate_snr_db(audio, &c)?,
+            diff_errs,
+            paired,
+            damaged_windows,
+            windows,
+        })
+    }
+
+    /// A CHARACTERISATION pin of the shipped timing lock (#1438), and of the SNR estimate at it.
+    ///
+    /// The half-Hann objective peaks a quarter symbol (8 samples) before the boundary, and the search
+    /// scans offsets `0..n`. So:
+    /// - **Leads 16 and 32** lock at 8 and 24, the objective's early peak. That is NOT simply a
+    ///   defect: the uncancelled decision arm is best sampled early, and against a fixed oracle phase
+    ///   this lock is at the oracle on AWGN and a flat fade and 1.5–2.1 dB off it on BPSK250
+    ///   `moderate_f1`; a pulse-matched objective measured worse there
+    ///   (`docs/dev/reviews/review-1438-snr-estimator.md`). (#1439 read lead 32 as a range defect;
+    ///   that premised the boundary as the target, which the same review overturned.)
+    /// - **Lead 0**: the restricted search (`find_timing_offset_with_expected`, `[0, n)`) locks at
+    ///   0 only because the peak (−8) lies before the slice — the REACHABILITY defect. #1438 PR2's
+    ///   widened search (`timing_locks_with_expected`, `[−n/2, n)`) reaches it: −8. At leads 16 and
+    ///   32 the two locks coincide.
+    ///
+    /// Until #1438 PR1 the SNR estimate read ≈ 3.5 dB at both early locks for a 30 dB signal (this
+    /// pin's own run then: 22.89 / 3.55 / 3.53 dB at leads 0 / 16 / 32), because it consumed the
+    /// crossfade-cancelled stream, which is correct only on the boundary. It now reads the channel at
+    /// each of the three locks this pin visits (28.96 / 29.93 / 30.14, reproduced by its default run).
+    /// **Expected to fail when either lock moves**; update the pin then, do not delete it.
+    #[test]
+    fn the_timing_search_locks_early_when_a_lead_makes_it_reachable() {
+        let c = cfg();
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let tx = crate::modulate::bpsk_modulate(&payload, &c).expect("modulate");
+        let rms = (tx.iter().map(|x| x * x).sum::<f32>() / tx.len() as f32).sqrt();
+        let sigma = rms / 10f32.powf(30.0 / 20.0);
+        let expected = expected_preamble_symbols(PREAMBLE_SYMS);
+        let run = |lead: usize| {
+            let mut st = 7u64;
+            let mut u = || -> f32 {
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((st >> 11) as f32 / (1u64 << 53) as f32).clamp(1e-9, 1.0 - 1e-9)
+            };
+            let mut b = vec![0.0f32; lead];
+            b.extend_from_slice(&tx);
+            for x in b.iter_mut() {
+                let (a, bb) = (u(), u());
+                *x += sigma * (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * bb).cos();
+            }
+            let locks = timing_locks_with_expected(
+                &b,
+                32,
+                c.center_frequency,
+                c.sample_rate as f32,
+                &expected,
+            );
+            assert_eq!(
+                locks.restricted,
+                find_timing_offset_with_expected(
+                    &b,
+                    32,
+                    c.center_frequency,
+                    c.sample_rate as f32,
+                    &expected
+                ),
+                "lead {lead}: the two-lock search's restricted half must BE the restricted search"
+            );
+            (locks, estimate_snr_db(&b, &c).expect("estimate"))
+        };
+        let (l0, snr0) = run(0);
+        let (l16, snr16) = run(16);
+        let (l32, snr32) = run(32);
+        println!("PIN leads 0/16/32: locks {l0:?}/{l16:?}/{l32:?}, SNR {snr0:.2}/{snr16:.2}/{snr32:.2} dB");
+        assert_eq!(
+            l0.restricted, 0,
+            "lead 0: the restricted [0, n) search locked at {}, not 0 (clamped: the peak is at −8)",
+            l0.restricted
+        );
+        assert_eq!(
+            l0.widened, -8,
+            "lead 0: the widened [−n/2, n) search locked at {}, not −8 — #1438 PR2's reachability fix",
+            l0.widened
+        );
+        for (lead, l, want) in [(16usize, l16, 8usize), (32, l32, 24)] {
+            assert_eq!(
+                l.widened, l.restricted as isize,
+                "lead {lead}: the two locks must coincide once the peak is reachable ({l:?})"
+            );
+            assert_eq!(
+                l.restricted, want,
+                "lead {lead} locked at {}, not {want}: the timing objective changed. #1438's review \
+                 measured the alternatives on a fade before rejecting them (docs/dev/reviews/\
+                 review-1438-snr-estimator.md); re-measure before accepting this",
+                l.restricted
+            );
+        }
+        for (lead, snr) in [(0, snr0), (16, snr16), (32, snr32)] {
+            assert!(
+                (snr - 30.0).abs() < 2.0,
+                "lead {lead} read {snr:.2} dB for a 30 dB signal: the estimate must read the channel \
+                 at every lock (before #1438 PR1 the early locks read ≈ 3.5 dB)"
+            );
+        }
+    }
+
+    /// #1435 / #1438: how the timing lock and the SNR estimate move with a lead before the frame.
+    ///
+    /// `find_timing_offset_with_expected` maximises the preamble correlation of `demodulate_iq`'s
+    /// half-Hann window, which is not matched to the modulator's full-Hann pulse. Computed from the two
+    /// window definitions, the current symbol's gain peaks at d = −9 samples (1.190; 1.188 at −8;
+    /// 1.000 at the boundary). Measured, the search locks at d = −8 wherever that is reachable
+    /// (lead − 8 for leads 9–31). It scans offsets `0..n` from the buffer start, so at lead 0 the
+    /// early optimum is unreachable — which is why every buffer-is-the-frame fixture locks correctly.
+    ///
+    /// The capped reading is measured (~3.5 dB for BPSK250 at a true 10–40 dB). Its attribution is
+    /// derived, not ablated: at d = −8 the next-symbol coefficient is 0.09 while
+    /// `cancel_crossfade_isi` subtracts 1/3, leaving ~0.24 of the next symbol as injected ISI.
+    ///
+    /// Whole-symbol leads alternate because the preamble is period-4: an odd shift cannot reach a
+    /// full-magnitude correlation lag and falls to the early optimum; an even shift locks ON THE
+    /// SYMBOL GRID but two symbols early (lead 64 → offset 0), where the estimate reads normally
+    /// because the per-window gain absorbs it. The sweep's "lock == true offset" column counts that
+    /// as a match; it is not a correct lock. Pinned by
+    /// [`the_timing_search_locks_early_when_a_lead_makes_it_reachable`].
+    #[test]
+    #[ignore = "measurement for #1435; run with --ignored --nocapture"]
+    fn lead_in_sweep_of_the_timing_lock_and_snr() {
+        let c = cfg();
+        let n = 32usize;
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let tx = crate::modulate::bpsk_modulate(&payload, &c).expect("modulate");
+        let rms = (tx.iter().map(|x| x * x).sum::<f32>() / tx.len() as f32).sqrt();
+        let snr_db: f32 = std::env::var("LEAD_SWEEP_SNR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10.0);
+        let sigma = rms / 10f32.powf(snr_db / 20.0);
+        println!("\n#1435 lead-in sweep, BPSK250 200 B, AWGN {snr_db} dB total power, 8 seeds");
+        println!("  lead (syms+samples) | est SNR mean  min   | lock == true offset");
+        let js: Vec<usize> = if std::env::var("LEAD_SWEEP_ALL_J").is_ok() {
+            (0..32).collect()
+        } else {
+            vec![0, 16]
+        };
+        let ks: Vec<usize> = if std::env::var("LEAD_SWEEP_ALL_J").is_ok() {
+            vec![0]
+        } else {
+            (0..=5).collect()
+        };
+        for &k in &ks {
+            for &j in &js {
+                let lead = k * n + j;
+                let (mut ests, mut locked) = (Vec::new(), 0);
+                for seed in 0..8u64 {
+                    let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    let mut u = || -> f32 {
+                        st = st
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ((st >> 11) as f32 / (1u64 << 53) as f32).clamp(1e-9, 1.0 - 1e-9)
+                    };
+                    let mut b = vec![0.0f32; lead];
+                    b.extend_from_slice(&tx);
+                    for x in b.iter_mut() {
+                        let (a, bb) = (u(), u());
+                        *x += sigma * (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * bb).cos();
+                    }
+                    if let Some(e) = estimate_snr_db(&b, &c) {
+                        ests.push(e);
+                    }
+                    let off = find_timing_offset_with_expected(
+                        &b,
+                        n,
+                        c.center_frequency,
+                        c.sample_rate as f32,
+                        &expected_preamble_symbols(PREAMBLE_SYMS),
+                    );
+                    if off == j {
+                        locked += 1;
+                    }
+                }
+                let mean = ests.iter().sum::<f32>() / ests.len().max(1) as f32;
+                let min = ests.iter().cloned().fold(f32::MAX, f32::min);
+                println!("  k={k} +{j:2} ({lead:4} smp)   | {mean:7.2}  {min:7.2} | {locked}/8");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement for #1435; run with --ignored --nocapture"]
+    fn shipped_vs_oracle_decisions_on_one_span() {
+        let c = cfg();
+        let payload: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let tx = crate::modulate::bpsk_modulate(&payload, &c).expect("modulate");
+        let t = truth(&payload);
+        let awgn = |snr: f32| {
+            move |x: &[f32], s: u64| {
+                AwgnChannel::new(AwgnConfig::new(snr, Some(s)))
+                    .expect("awgn")
+                    .apply(x)
+            }
+        };
+        let fade = |snr: f32| {
+            move |x: &[f32], s: u64| {
+                let mut w = WattersonConfig::moderate_f1(Some(s));
+                w.snr_db = snr;
+                WattersonChannel::new(w).expect("watterson").apply(x)
+            }
+        };
+        type Chan = Box<dyn Fn(&[f32], u64) -> Vec<f32>>;
+        let cells: Vec<(&str, Chan)> = vec![
+            ("clean  awgn 30 dB", Box::new(awgn(30.0))),
+            ("awgn  +2 dB", Box::new(awgn(2.0))),
+            ("awgn   0 dB", Box::new(awgn(0.0))),
+            ("awgn  -2 dB", Box::new(awgn(-2.0))),
+            ("awgn  -4 dB", Box::new(awgn(-4.0))),
+            ("fade   8 dB", Box::new(fade(8.0))),
+            ("fade  12 dB", Box::new(fade(12.0))),
+            ("fade  20 dB", Box::new(fade(20.0))),
+        ];
+        let mut offsets = Vec::new();
+        let mut all: Vec<(f32, usize, usize)> = Vec::new();
+        println!("\n#1435  cell              | shipped oracle  s-o  | diff-errs paired | damaged/windows");
+        for (name, chan) in &cells {
+            let rows: Vec<Row> = (0..16u64)
+                .filter_map(|s| measure(&chan(&tx, s), &t))
+                .collect();
+            let n = rows.len().max(1) as f32;
+            let mean = |f: &dyn Fn(&Row) -> f32| rows.iter().map(f).sum::<f32>() / n;
+            println!(
+                "        {name:17} | {:7.2} {:6.2} {:+5.2} | {:9.1} {:6.1} | {:5.1}/{:.0}",
+                mean(&|r| r.shipped),
+                mean(&|r| r.oracle),
+                mean(&|r| r.shipped - r.oracle),
+                mean(&|r| r.diff_errs as f32),
+                mean(&|r| r.paired as f32),
+                mean(&|r| r.damaged_windows as f32),
+                mean(&|r| r.windows as f32),
+            );
+            for r in &rows {
+                offsets.push(r.product - r.shipped);
+                all.push((r.shipped - r.oracle, r.damaged_windows, r.paired));
+            }
+            // The tail, not the mean: #1435 is about the WORST frames (the cancelled arm failed RS).
+            let mut worst: Vec<&Row> = rows.iter().collect();
+            worst.sort_by(|a, b| {
+                (a.shipped - a.oracle)
+                    .partial_cmp(&(b.shipped - b.oracle))
+                    .unwrap()
+            });
+            for r in worst.iter().take(3) {
+                println!(
+                    "           worst: shipped {:6.2} oracle {:6.2} s-o {:+6.2} | diff-errs {:3} paired {:3} | damaged {:3}",
+                    r.shipped, r.oracle, r.shipped - r.oracle, r.diff_errs, r.paired, r.damaged_windows
+                );
+            }
+            if name.starts_with("clean") {
+                for r in &rows {
+                    assert_eq!(
+                        r.diff_errs, 0,
+                        "clean control made decision errors — fixture or truth is wrong"
+                    );
+                    assert_eq!(
+                        r.shipped, r.oracle,
+                        "clean control: shipped and oracle must be identical"
+                    );
+                }
+            }
+        }
+        // FIDELITY: the shipped reconstruction here IS the product's estimate, up to one constant
+        // (the channel-SNR conversion). A varying offset means this probe measures its own copy.
+        let (lo, hi) = offsets
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(
+            hi - lo < 1e-3,
+            "probe reconstruction diverges from estimate_snr_db: offset spread {}",
+            hi - lo
+        );
+        // Association: does the shortfall follow damaged windows, or paired errors?
+        let corr = |xs: &[f32], ys: &[f32]| {
+            let (mx, my) = (
+                xs.iter().sum::<f32>() / xs.len() as f32,
+                ys.iter().sum::<f32>() / ys.len() as f32,
+            );
+            let cov: f32 = xs.iter().zip(ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+            let vx: f32 = xs.iter().map(|x| (x - mx).powi(2)).sum();
+            let vy: f32 = ys.iter().map(|y| (y - my).powi(2)).sum();
+            cov / (vx * vy).sqrt().max(1e-12)
+        };
+        let short: Vec<f32> = all.iter().map(|a| a.0).collect();
+        let dmg: Vec<f32> = all.iter().map(|a| a.1 as f32).collect();
+        let prd: Vec<f32> = all.iter().map(|a| a.2 as f32).collect();
+        println!(
+            "        corr(shipped-oracle, damaged windows) = {:+.3}",
+            corr(&short, &dmg)
+        );
+        println!(
+            "        corr(shipped-oracle, paired errors)   = {:+.3}",
+            corr(&short, &prd)
+        );
+        println!(
+            "        product-vs-probe offset constant to {:.2e} dB",
+            hi - lo
+        );
     }
 }

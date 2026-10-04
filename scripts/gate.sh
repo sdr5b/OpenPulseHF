@@ -62,6 +62,15 @@ case "${1:-}" in
     *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac
 
+# Queue behind any other heavy build on this machine, in any project, before
+# anything is timed or snapshotted — so time spent waiting is not part of the run,
+# and START_HEAD below is taken after the wait. `--fingerprint` is exempt: it is
+# the seconds-long primitive and builds nothing.
+if [ "$MODE" != "fingerprint" ]; then
+    # shellcheck source=scripts/lib/host-build-lock.sh
+    source "$REPO_ROOT/scripts/lib/host-build-lock.sh" "gate"
+fi
+
 COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then DIRTY="dirty"; else DIRTY="clean"; fi
 
@@ -81,6 +90,30 @@ run_step() {
     echo "=== end $step_name: exit $rc ===" >> "$LOG"
     if [ "$rc" -eq 0 ]; then echo "ok"; else echo "FAILED (exit $rc)"; fi
     return $rc
+}
+
+# The installed pre-push hook vs the versioned one (#1448). cargo-husky 1.5.0 copies
+# `.cargo-husky/hooks/pre-push` into the hooks dir only when no hook from the same cargo-husky
+# version is there yet, so once installed, a change to the versioned hook never reaches the hook git
+# runs — and nothing noticed: a maintainer host ran a hook missing three later passes. cargo-husky
+# inserts two header lines after the shebang (`#` and `# This hook was set by cargo-husky …`);
+# `normalise_hook` strips exactly that pair, so a header-bearing install and a plain `cp` both
+# compare equal to the source. A missing hook (fresh clone, CI before any build) is not drift.
+normalise_hook() { sed -e '2{/^#$/{N;/set by cargo-husky/d;};}' "$1"; }
+hook_drift() {
+    versioned=".cargo-husky/hooks/pre-push"
+    installed="$(git rev-parse --git-path hooks/pre-push)"
+    if [ ! -f "$installed" ]; then
+        echo "no installed pre-push hook at $installed — nothing to compare"
+        return 0
+    fi
+    if cmp -s <(normalise_hook "$installed") <(normalise_hook "$versioned"); then
+        echo "installed pre-push hook matches $versioned"
+        return 0
+    fi
+    echo "installed pre-push hook at $installed differs from $versioned:"
+    diff <(normalise_hook "$versioned") <(normalise_hook "$installed") | head -40
+    return 1
 }
 
 self_test() {
@@ -186,6 +219,10 @@ JSON
 echo "gate: commit $COMMIT ($DIRTY)  log $LOG"
 rc_total=0
 drift_check
+# The build lock itself (fnec-rust FND-184): a nested take must not wait on its own
+# parent, and an unrelated process must still wait. On a scratch lock file, so it
+# runs here while this gate holds the real one.
+run_step "host-build-lock self-test" bash scripts/test-host-build-lock.sh || rc_total=1
 run_step "cargo fmt --check" cargo fmt --all -- --check || rc_total=1
 drift_check
 run_step "cargo clippy -D warnings" cargo clippy --workspace --no-default-features --all-targets -- -D warnings || rc_total=1
@@ -204,6 +241,44 @@ drift_check
 # DOWNSTREAM crate's production code calling an instruments item also escapes, because that crate's
 # lib builds against the ON modem. ~1 s warm; 9.1 s from a cold modem lib.
 run_step "cargo clippy (shipped cfg) -D warns" cargo clippy --workspace --no-default-features -- -D warnings || rc_total=1
+drift_check
+# FEATURE-GATED code, which neither pass above compiles at all (#1380). `#[cfg(feature = "x")]` code
+# must still PARSE when the feature is off, so a syntax error is caught — but nothing after parsing
+# is: type errors, borrow errors, wrong arity, a renamed method. That is exactly the code most likely
+# to drift, because nobody compiles it while editing something else. Precedent is not hypothetical:
+# PR #424 found a build break, a clippy finding and a flaky test reachable only through the `gpu`
+# feature, and this pass found two more the day it was written — a `serve`-gated test left behind
+# when `LinkParams` gained two fields (uncompilable, therefore never run, for ~3 months) and a
+# `float-literal-f32-fallback` in the `gui` binary that rustc says becomes a hard error.
+#
+# `--all-features` rather than a list of crate+feature pairs: a hand-maintained mirror of the feature
+# set is the same rotting artifact this pass exists to catch. Safe because every feature here is
+# ADDITIVE (`generic-serial = ["serial"]`); there is no mutually exclusive pair to break.
+#
+# TWO STATED LIMITS, neither closed by this pass:
+#   * Not closed over TARGETS. A feature whose optional dependency is target-filtered (gpio's
+#     `gpiocdev` is `[target.'cfg(target_os = "linux")']`) compiles here but not elsewhere; the code
+#     must carry `all(target_os = ..., feature = ...)`, as gpio.rs now does.
+#   * Not closed over the SHIPPED recipe. `--all-features` turns `instruments` on, so an
+#     instruments-only item called from a `cpal-backend`-gated production path passes all three
+#     passes and fails only `cargo build --release -p openpulse-cli --features cpal-backend`. Zero
+#     instances today; it is a residual, not a claim of completeness.
+#
+# The preflight is NOT ceremony: --all-features pulls alsa-sys, libudev-sys and libdbus-sys, whose
+# build scripts call pkg_config and PANIC when a .pc file is absent. Without this, a missing distro
+# package reads as an unintelligible build-script backtrace in the middle of clippy output.
+missing_pc=""
+for pc in alsa libudev dbus-1; do
+    pkg-config --exists "$pc" 2>/dev/null || missing_pc="$missing_pc $pc"
+done
+if [ -n "$missing_pc" ]; then
+    printf '  %-38s%s\n' "cargo clippy (all features)" "SKIPPED (missing pkg-config:$missing_pc)"
+    echo "  install: libasound2-dev libudev-dev libdbus-1-dev  (Debian/Ubuntu names)"
+    echo "=== cargo clippy (all features): SKIPPED — missing pkg-config:$missing_pc ===" >> "$LOG"
+    rc_total=1
+else
+    run_step "cargo clippy (all features) -D warns" cargo clippy --workspace --all-features --all-targets -- -D warnings || rc_total=1
+fi
 
 TEST_CMD="none"
 if [ "$MODE" = "full" ]; then
@@ -270,6 +345,12 @@ if [ "$MODE" = "full" ]; then
     # and passes vacuously.
     drift_check
     run_step "re-homed docs lint" scripts/check-rehomed-docs.sh || rc_total=1
+    # The hook git actually runs must be the hook in the tree (#1448); see hook_drift above.
+    drift_check
+    run_step "installed pre-push hook" hook_drift || {
+        rc_total=1
+        echo "    refresh it: cp .cargo-husky/hooks/pre-push \"$(git rev-parse --git-path hooks/pre-push)\""
+    }
 fi
 
 drift_check   # final boundary: nothing moved between the last step and the verdict
@@ -293,10 +374,10 @@ fi
 
 echo ""
 echo "suites=$suites tests_passed=$passed tests_failed=$failed"
-# A green gate must not read as "everything passed". Two acceptance suites are held out for
-# runtime (#1274) — REQ-QRM-01's notch gate and the OTA rate-adaptation suite, ~83 min between
-# them — and nothing else in this output would say so.
-echo "held-out (runtime, #1274): notch_rescues_interferer, ota_channel_adaptation — run scripts/slow-tests.sh"
+# A green gate must not read as "everything passed". Acceptance suites are held out for runtime
+# (#1274) — REQ-QRM-01's notch gate and the OTA rate-adaptation suite, ~83 min between them, and the
+# spectral-busy decode counts (#1454) — and nothing else in this output would say so.
+echo "held-out (runtime, #1274): notch_rescues_interferer, ota_channel_adaptation, spectral_busy_gathers_weak_frames (decode counts, #1454) — run scripts/slow-tests.sh"
 
 if [ "$MODE" = "quick" ]; then
     echo "GATE: PARTIAL $COMMIT $DIRTY $STAMP (fmt+clippy only — NOT a gate, no token written)"

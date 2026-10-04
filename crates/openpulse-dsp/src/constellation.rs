@@ -342,21 +342,64 @@ pub fn snr_db_from_amp_noise(amp: f32, noise_var_per_dim: f32) -> f32 {
 /// Scale that turns a differential correlation `dot_k = Re(z_k · conj(z_{k−1}))` into a
 /// log-likelihood ratio, given the quadrature companion `cross_k = Im(z_k · conj(z_{k−1}))`.
 ///
-/// `dot` is antipodal with mean `±A²`; `cross` has mean 0 and variance `≈ 2A²σ²`. So
-/// `2·mean|dot| / var(cross) → 1/σ²` and the signal amplitude cancels — which is what makes this
-/// immune to the symbol-amplitude variation that defeats a variance-of-`|dot|` estimate.
+/// **The target is `2A²/var(dot)`, NOT `1/σ²` — corrected in #1364, and the difference is the whole
+/// defect.** `1/σ²` is the *high-SNR limit* of the true DBPSK LLR slope, not the slope. The true
+/// slope vanishes with the signal, and an estimator that holds `1/σ²` all the way down keeps voting
+/// at full confidence on an attempt that carries no signal at all. Measured on the shipped formula
+/// (`2·mean|dot|/var(cross)`): a noise-only attempt emitted LLRs of std **1.41 at every σ from 0.1
+/// to 2.0** — which is exactly `√2`, i.e. exactly the old contract honoured. Against the true
+/// pairwise DBPSK LLR the old formula is **8× over-confident at −12 dB** (slope 0.94 versus 0.11).
+///
+/// This matters because `combine_llrs_map` SUMS attempts: `hpx_hf` SL2–SL5 run this path, and the
+/// OTA arm retains failed bursts, so a worthless attempt does not merely fail to help — it outvotes
+/// the attempts that carry the frame.
+///
+/// The estimator is the Gaussian-approximation LLR `2μ_x/s²` with an unbiased fourth-moment `Â²`:
+/// for iid circular noise `E[dot²] − E[cross²] = A⁴` **exactly**, because the `A²v` and `v²/2` terms
+/// are common to both. So `Â² = √(max(0, ⟨dot²⟩ − ⟨cross²⟩))` and the scale is `2Â²/⟨cross²⟩`,
+/// which tends to `1/σ²` at high SNR and to **0** as the signal vanishes.
+///
+/// **Premise, pinned by `differential_llr_scale_assumes_iid_noise` rather than trusted:** the noise
+/// must be uncorrelated at lag 1. `cancel_crossfade_isi` induces ρ = −1/3 (#1361), under which the
+/// identity returns `2ρ²v² = 0.889v²` at A = 0 — a constant floor that would restore the defect. The
+/// soft path deliberately does not cancel; if #1361 ever changes that, derive the β-corrected
+/// identity instead of reusing this one.
+///
+/// No blind estimator does better than `N^-1/4` at A = 0: the score for `A²` equals the score for
+/// `v` there, so the Fisher information is singular — the known blind-SNR degeneracy. The residual
+/// is sampling noise, not bias, and `SCALE_FLOOR` keeps a zero estimate from emitting `−0.0` LLRs,
+/// which `l < 0.0` consumers would read as bit 0.
 ///
 /// Multiply the `dot` values by the result. Returns 0 for an empty input.
 pub fn differential_llr_scale(dots: &[f32], crosses: &[f32]) -> f32 {
     if dots.is_empty() || crosses.is_empty() {
         return 0.0;
     }
-    let mu = dots.iter().map(|v| v.abs()).sum::<f32>() / dots.len() as f32;
-    let var_cross = crosses.iter().map(|v| v * v).sum::<f32>() / crosses.len() as f32;
-    2.0 * mu / var_cross.max(1e-12)
+    // f64 accumulators: these are fourth moments, and the subtraction below is catastrophic
+    // cancellation by construction — at A = 0 the two means are equal in expectation.
+    let m_dot2 = dots.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / dots.len() as f64;
+    let m_cross2 = crosses
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        / crosses.len() as f64;
+    let a2 = (m_dot2 - m_cross2).max(0.0).sqrt();
+    ((2.0 * a2 / m_cross2.max(1e-12)) as f32).max(SCALE_FLOOR)
 }
 
+/// Smallest scale `differential_llr_scale` will return, so a zero estimate cannot emit `−0.0`.
+///
+/// `combine_llrs_map` treats 0.0 as "no information" and is indifferent, but a consumer testing
+/// `l < 0.0` reads `−0.0` as bit 0 — the convention split `soft_demod_conformance` exists to keep
+/// closed. Small enough that an attempt scaled by it contributes nothing to a sum.
+const SCALE_FLOOR: f32 = 1e-6;
+
 /// Additive SNR (dB) of a symbol block, with the *multiplicative* channel removed first.
+///
+/// DORMANT(#1438): no production caller since BPSK's estimator moved to
+/// [`isi_aware_snr_db_windowed`], which removes the neighbour-symbol taps this one counts as noise.
+/// Kept as the one-tap reference: #1439's characterisation probes and this module's tests measure
+/// against it, and it is the natural estimator for a plugin whose stream carries no ISI.
 ///
 /// This is the symbol-domain twin of `openpulse_channel::estimate_additive_snr_db`, and it exists for
 /// the same reason: on a fading channel `z[k] ≈ h[k]·s[k] + n[k]`, and any estimator that measures the
@@ -408,6 +451,132 @@ pub fn additive_snr_db_windowed(rx: &[Complex32], decisions: &[Complex32], windo
         return 0.0;
     }
     10.0 * (sig / noise.max(1e-12)).max(1e-12).log10() as f32
+}
+
+/// Remove a frame-global residual carrier frequency from a decision-aligned symbol stream, in place;
+/// returns the estimate in radians per symbol.
+///
+/// `ω̂ = arg Σ m_k·m*_{k−1}` with `m_k = rx_k·d*_k`: the data-aided mean phase increment. A residual
+/// frequency ramps the phase inside every window of [`isi_aware_snr_db_windowed`], and a per-window
+/// complex tap cannot absorb a ramp: on BPSK250 at 30 dB true, a 1 Hz residual capped that estimate
+/// at ≈ 24 dB of Es/N0 at W = 8, ≈ 6 dB lower per doubling of W or of the offset, while the AFC
+/// deliberately leaves offsets under `AFC_SETTLE_DEADBAND_HZ` (2 Hz) uncorrected (#1438).
+///
+/// One estimate per frame, not per window: a per-64-symbol estimate measured noisier than no
+/// derotation at all. On a fade the Doppler spread is zero-mean, so `ω̂ ≈ 0` and nothing changes.
+///
+/// When `decisions` come from a differential decode of `rx` itself, `d_k·d*_{k−1}` is the sign of
+/// `Re(rx_k·rx*_{k−1})`, so every term has a non-negative real part: the estimate folds into
+/// (−π/2, π/2] (an unambiguous range of ±baud/4), and a decision error flips the imaginary part of
+/// ONE term rather than of every later one. Low-SNR errors therefore bias `|ω̂|` low, so the reading
+/// under-derotates and reads low, the safe direction for a rate decision.
+pub fn remove_residual_frequency(rx: &mut [Complex32], decisions: &[Complex32]) -> f32 {
+    let n = rx.len().min(decisions.len());
+    let mut acc = Complex32::new(0.0, 0.0);
+    for k in 1..n {
+        let m = rx[k] * decisions[k].conj();
+        let m_prev = rx[k - 1] * decisions[k - 1].conj();
+        acc += m * m_prev.conj();
+    }
+    if acc.norm_sqr() == 0.0 {
+        return 0.0;
+    }
+    let w = acc.arg();
+    for (k, z) in rx.iter_mut().enumerate() {
+        *z *= Complex32::from_polar(1.0, -w * k as f32);
+    }
+    w
+}
+
+/// Additive SNR (dB) with the multiplicative channel AND each symbol's two neighbours removed.
+///
+/// [`additive_snr_db_windowed`] fits one complex gain per window, so inter-symbol interference in the
+/// stream counts as noise and caps the estimate. BPSK's uncancelled crossfade stream carries exactly
+/// that: sampled early, where its decoder is best, the neighbour taps put an Es/N0 floor of ≈ 22.8 dB
+/// under the one-tap fit, which on BPSK31 is a cap of ≈ 3 dB of channel SNR (with BPSK's 4.4 dB
+/// matched-filter constant), below SL2's climb ceiling (#1438). This fits `rx_k ≈ a·d_{k−1} + b·d_k + c·d_{k+1}` per window by least squares and counts
+/// only `|b·d_k|²` as signal.
+///
+/// Signal and residual are summed over all windows before the ratio, so the frame-level variance is
+/// set by the frame length rather than the window, and each window's residual is scaled by `W/(W−3)`
+/// for its three fitted taps. A window whose Gram matrix is singular (a run of constant or
+/// alternating decisions) is skipped; the noise it would have measured is independent of the data,
+/// so skipping it is unbiased. Returns `None` when `window ≤ 3`, when no window can be fitted, or when
+/// no signal was measured.
+///
+/// Decision-directed like its one-tap twin: it saturates once symbol errors are common. It measures
+/// `|b|²` against what the neighbour taps leave behind, which EXCLUDES interference the decoder
+/// itself suffers: a channel-SNR reading, not the SNR the decoder sees.
+pub fn isi_aware_snr_db_windowed(
+    rx: &[Complex32],
+    decisions: &[Complex32],
+    window: usize,
+) -> Option<f32> {
+    const TAPS: usize = 3;
+    let n = rx.len().min(decisions.len());
+    if window <= TAPS {
+        return None;
+    }
+    let dof_scale = window as f64 / (window - TAPS) as f64;
+    let (mut sig, mut noise) = (0.0f64, 0.0f64);
+    // Symbol k needs d_{k−1} and d_{k+1}, so windows tile [1, n − 1).
+    let mut start = 1usize;
+    while start + window < n {
+        let end = start + window;
+        let mut gram = [[Complex32::new(0.0, 0.0); TAPS]; TAPS];
+        let mut rhs = [Complex32::new(0.0, 0.0); TAPS];
+        for k in start..end {
+            let x = [decisions[k - 1], decisions[k], decisions[k + 1]];
+            for i in 0..TAPS {
+                rhs[i] += x[i].conj() * rx[k];
+                for j in 0..TAPS {
+                    gram[i][j] += x[i].conj() * x[j];
+                }
+            }
+        }
+        if let Some(taps) = solve3(gram, rhs, 1e-3 * window as f32) {
+            let mut resid = 0.0f64;
+            for k in start..end {
+                let s = taps[1] * decisions[k];
+                let fit = taps[0] * decisions[k - 1] + s + taps[2] * decisions[k + 1];
+                sig += s.norm_sqr() as f64;
+                resid += (rx[k] - fit).norm_sqr() as f64;
+            }
+            noise += resid * dof_scale;
+        }
+        start = end;
+    }
+    if sig <= 0.0 {
+        return None;
+    }
+    Some(10.0 * (sig / noise.max(1e-12)).max(1e-12).log10() as f32)
+}
+
+/// Solve a 3×3 complex system by Gauss–Jordan with partial pivoting; `None` when a pivot falls below
+/// `min_pivot`, i.e. the window's decisions do not span three independent taps.
+fn solve3(
+    mut a: [[Complex32; 3]; 3],
+    mut b: [Complex32; 3],
+    min_pivot: f32,
+) -> Option<[Complex32; 3]> {
+    for col in 0..3 {
+        let p = (col..3).max_by(|&r, &s| a[r][col].norm().total_cmp(&a[s][col].norm()))?;
+        if a[p][col].norm() < min_pivot {
+            return None;
+        }
+        a.swap(col, p);
+        b.swap(col, p);
+        let pivot_row = a[col];
+        let pivot_rhs = b[col];
+        for r in (0..3).filter(|&r| r != col) {
+            let f = a[r][col] / pivot_row[col];
+            for (x, &p) in a[r].iter_mut().zip(pivot_row.iter()) {
+                *x -= f * p;
+            }
+            b[r] -= f * pivot_rhs;
+        }
+    }
+    Some([b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2]])
 }
 
 /// Estimate decision-directed noise variance from a block of equalised symbols
@@ -552,42 +721,164 @@ pub fn normalize_stream_rms(syms: &mut [(f32, f32)]) {
 
 #[cfg(test)]
 mod tests {
-    /// `differential_llr_scale` must recover 1/σ² independently of the signal amplitude — that
-    /// cancellation is the whole point (a `var(|dot|)` estimate is defeated by amplitude variation).
+    /// Deterministic complex Gaussian pair, so these tests need no `rand` dependency.
+    fn zz_gauss(state: &mut u64) -> (f32, f32) {
+        let mut u = || {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (((*state >> 11) as f64) / ((1u64 << 53) as f64)).clamp(1e-12, 1.0)
+        };
+        let (u1, u2) = (u(), u());
+        let r = (-2.0 * u1.ln()).sqrt();
+        (
+            (r * (std::f64::consts::TAU * u2).cos()) as f32,
+            (r * (std::f64::consts::TAU * u2).sin()) as f32,
+        )
+    }
+
+    /// `dot`/`cross` from ACTUAL complex symbols `z_k = A·a_k + n_k`, not from the asymptotic model.
     ///
-    /// Only above the ~3 dB where `mean|dot| ≈ A²` holds; below it the estimator is decision-directed
-    /// and saturates, which is the safe direction (under-confident LLRs).
+    /// This is the whole reason #1364 went unnoticed: the previous fixture synthesised `dots` and
+    /// `crosses` directly as `±A² + √(2A²σ²)·g` and `√(2A²σ²)·g`, which **omits the `n·conj(n)`
+    /// term** — the term that produces the low-SNR floor. A fixture built from the asymptotic limit
+    /// cannot exhibit a defect that lives below that limit, and it swept only 10 and 20 dB.
+    /// `v` is total complex noise power `E|n|²`.
+    fn zz_dots_crosses(amp: f32, v: f32, n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let mut st = seed | 1;
+        let sigma_c = (v / 2.0).sqrt(); // per component
+        let mut bit = 1.0f32;
+        let z: Vec<(f32, f32)> = (0..n)
+            .map(|i| {
+                if i % 3 == 0 {
+                    bit = -bit; // a differentially-encoded antipodal stream, not a constant one
+                }
+                let (gr, gi) = zz_gauss(&mut st);
+                (amp * bit + sigma_c * gr, sigma_c * gi)
+            })
+            .collect();
+        let (mut d, mut c) = (Vec::new(), Vec::new());
+        for k in 1..z.len() {
+            let ((xr, xi), (yr, yi)) = (z[k], z[k - 1]);
+            d.push(xr * yr + xi * yi);
+            c.push(xi * yr - xr * yi);
+        }
+        (d, c)
+    }
+
+    /// The formula shipped before #1364, kept as the CONTROL: it must fail the properties below.
+    /// A test whose old implementation also passes is not measuring the change.
+    fn zz_old_scale(dots: &[f32], crosses: &[f32]) -> f32 {
+        let mu = dots.iter().map(|v| v.abs()).sum::<f32>() / dots.len() as f32;
+        let vc = crosses.iter().map(|v| v * v).sum::<f32>() / crosses.len() as f32;
+        2.0 * mu / vc.max(1e-12)
+    }
+
+    /// The scale must track the Gaussian-approximation LLR slope `2A²/var(dot)` across the whole
+    /// range — **including A = 0, where it must vanish** (#1364).
+    ///
+    /// `1/σ²` is the high-SNR LIMIT of the true DBPSK slope, not the slope; holding it all the way
+    /// down is what let a signal-free attempt vote at full strength into `combine_llrs_map`.
     #[test]
-    fn differential_llr_scale_recovers_inverse_noise_var_at_any_amplitude() {
+    fn differential_llr_scale_tracks_the_true_slope_not_the_high_snr_limit() {
+        let n = 20_000;
+        // Swept only where the target is RESOLVABLE TO THIS TOLERANCE, and the bound is derived
+        // rather than chosen. The estimate rests on `⟨dot²⟩ − ⟨cross²⟩ = A⁴`, whose sampling spread
+        // is `O(v²/√N)`. Two different limits follow, and conflating them cost two iterations here:
+        //   * RESOLVABLE at all: `A⁴ ≳ v²/√N`, i.e. `Es/N0 ≳ N^(−1/4)` = −10.8 dB at N = 20 000.
+        //     Below this no blind estimator can separate `A²` from `v` — the Fisher information is
+        //     singular at A = 0 — so a tracking assertion there would be asserting against noise.
+        //   * Tracking to 20 %: needs `spread ≲ 0.44·A⁴`, about 2× more margin in `Es/N0`, i.e.
+        //     ≳ −6 dB at this N. Measured: −12 dB reads 2.01× target, −9 dB reads 1.36×, both the
+        //     sampling floor rather than a defect.
+        // The A = 0 end is covered by `a_signal_free_attempt_votes_at_essentially_nothing`, which
+        // asserts the floor itself instead of a ratio to it.
         for amp in [0.2f32, 1.0, 5.0] {
-            for snr_db in [10.0f32, 20.0] {
-                let sigma2 = amp * amp / 10f32.powf(snr_db / 10.0);
-                // dot ~ ±A² with var 2A²σ²; cross ~ 0 with the same variance.
-                let n = 20_000;
-                let mut state = 0x1234u64;
-                let mut g = || {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let u1 = (((state >> 11) as f64) / ((1u64 << 53) as f64)).clamp(1e-12, 1.0);
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let u2 = ((state >> 11) as f64) / ((1u64 << 53) as f64);
-                    ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
-                };
-                let sd = (2.0 * amp * amp * sigma2).sqrt();
-                let dots: Vec<f32> = (0..n)
-                    .map(|i| {
-                        let b = if i % 3 == 0 { -1.0 } else { 1.0 };
-                        b * amp * amp + sd * g()
-                    })
-                    .collect();
-                let crosses: Vec<f32> = (0..n).map(|_| sd * g()).collect();
-                let k = differential_llr_scale(&dots, &crosses);
-                let expected = 1.0 / sigma2;
+            for es_n0_db in [-6.0f32, 0.0, 6.0, 20.0] {
+                let v = amp * amp / 10f32.powf(es_n0_db / 10.0);
+                let (d, c) = zz_dots_crosses(amp, v, n, 0x5EED);
+                let got = differential_llr_scale(&d, &c);
+                // Gaussian-approximation LLR slope: 2·mean(dot) / var(dot),
+                // with var(dot) = A²v + v²/2 for iid circular noise.
+                let want = 2.0 * amp * amp / (amp * amp * v + v * v / 2.0);
                 assert!(
-                    (k / expected - 1.0).abs() < 0.15,
-                    "amp={amp} snr={snr_db} dB (σ²={sigma2:.5}): scale {k:.2} vs expected {expected:.2}"
+                    (got / want - 1.0).abs() < 0.20,
+                    "amp={amp} Es/N0={es_n0_db} dB: scale {got:.4} vs derived target {want:.4}"
                 );
             }
         }
+    }
+
+    /// A signal-free attempt must not vote. The bound is DERIVED, not fitted: with no signal the
+    /// only estimate left is sampling noise in `⟨dot²⟩ − ⟨cross²⟩`, whose conditional mean gives
+    /// `std(LLR) ≈ 2.76·N^(−1/4)`; the assertion allows 2×. The old formula returns √2 ≈ 1.41 here
+    /// at EVERY noise level, which is the defect — and the control below pins that it did.
+    #[test]
+    fn a_signal_free_attempt_votes_at_essentially_nothing() {
+        let n = 20_000;
+        let bound = 2.0 * 2.76 / (n as f32).powf(0.25);
+        for v in [0.02f32, 0.125, 0.5, 2.0, 8.0] {
+            let (d, c) = zz_dots_crosses(0.0, v, n, 0x5EED);
+            let sd = |k: f32| {
+                let l: Vec<f32> = d.iter().map(|x| x * k).collect();
+                let m = l.iter().sum::<f32>() / l.len() as f32;
+                (l.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / l.len() as f32).sqrt()
+            };
+            let now = sd(differential_llr_scale(&d, &c));
+            let before = sd(zz_old_scale(&d, &c));
+            assert!(
+                now <= bound,
+                "v={v}: signal-free vote {now:.3} exceeds derived bound {bound:.3}"
+            );
+            // The control: the pre-#1364 formula votes at √2 regardless of noise power, which is
+            // the old contract honoured exactly. If this stops holding, the control has rotted and
+            // the assertion above is no longer measuring the change.
+            assert!(
+                (before - std::f32::consts::SQRT_2).abs() < 0.25,
+                "v={v}: control expected the old formula to vote ~1.41, got {before:.3}"
+            );
+        }
+    }
+
+    /// PREMISE PIN (#1364 × #1361). The identity `E[dot²] − E[cross²] = A⁴` holds only for noise
+    /// uncorrelated at lag 1. `cancel_crossfade_isi`'s backward substitution induces ρ = −1/3, under
+    /// which a signal-free attempt yields `2ρ²v²` instead of 0 — restoring the defect silently.
+    ///
+    /// The soft path deliberately does not cancel, so the premise holds today. This test exists so
+    /// that if #1361 ever changes that, the coupling is a failing test rather than a silent
+    /// regression in HARQ weighting.
+    #[test]
+    fn differential_llr_scale_assumes_iid_noise() {
+        let n = 20_000;
+        let v = 0.5f32;
+        let (d_iid, c_iid) = zz_dots_crosses(0.0, v, n, 0x5EED);
+        let iid_vote = differential_llr_scale(&d_iid, &c_iid) * d_iid[0].abs().max(1e-9);
+
+        // Same stream with the cancellation's lag-1 correlation imposed on the NOISE.
+        let mut st = 0x5EEDu64 | 1;
+        let sc = (v / 2.0).sqrt();
+        let raw: Vec<(f32, f32)> = (0..n + 1).map(|_| zz_gauss(&mut st)).collect();
+        let beta = 1.0f32 / 3.0;
+        let z: Vec<(f32, f32)> = (1..raw.len())
+            .map(|k| {
+                (
+                    sc * (raw[k].0 - beta * raw[k - 1].0),
+                    sc * (raw[k].1 - beta * raw[k - 1].1),
+                )
+            })
+            .collect();
+        let (mut d, mut c) = (Vec::new(), Vec::new());
+        for k in 1..z.len() {
+            let ((xr, xi), (yr, yi)) = (z[k], z[k - 1]);
+            d.push(xr * yr + xi * yi);
+            c.push(xi * yr - xr * yi);
+        }
+        let m_d2 = d.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / d.len() as f64;
+        let m_c2 = c.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / c.len() as f64;
+        assert!(
+            m_d2 - m_c2 > 0.2 * (v as f64) * (v as f64),
+            "lag-1 correlated noise should break the identity (got {:.4}, iid vote {iid_vote:.6}); \
+             if it no longer does, re-derive before letting the soft path cancel (#1361)",
+            m_d2 - m_c2
+        );
     }
 
     /// The orthogonal residual must track σ² even when the symbol *amplitude* wanders — the failure
@@ -830,6 +1121,142 @@ mod tests {
             windowed > global + 15.0,
             "windowing is the mechanism: windowed {windowed:.1} dB vs single-gain {global:.1} dB — \
              a single gain counts the rotation as noise, which is the #934 defect"
+        );
+    }
+
+    /// Unit-variance complex Gaussian noise (Box–Muller over xorshift) and random ±1 symbols.
+    fn isi_fixture(
+        seed: u64,
+        n: usize,
+        taps: [Complex32; 3],
+        sigma: f32,
+    ) -> (Vec<Complex32>, Vec<Complex32>) {
+        let mut st = seed;
+        let mut u = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 11) as f32 / (1u64 << 53) as f32).clamp(1e-9, 1.0 - 1e-9)
+        };
+        let d: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(if u() > 0.5 { 1.0 } else { -1.0 }, 0.0))
+            .collect();
+        let rx = (0..n)
+            .map(|k| {
+                let prev = if k > 0 { d[k - 1] } else { d[k] };
+                let next = if k + 1 < n { d[k + 1] } else { d[k] };
+                let (a, b) = (u(), u());
+                let r = (-2.0 * a.ln()).sqrt() * sigma;
+                let noise = Complex32::from_polar(r, std::f32::consts::TAU * b)
+                    * std::f32::consts::FRAC_1_SQRT_2;
+                taps[0] * prev + taps[1] * d[k] + taps[2] * next + noise
+            })
+            .collect();
+        (rx, d)
+    }
+
+    /// The property #1438 needs: through neighbour-symbol interference the ISI-aware estimate reads
+    /// the true `|b|²/σ²`, where the one-tap estimate is capped by the interference it counts as noise.
+    /// The taps are of the order of BPSK's early-sampled crossfade residue (a few percent of the main
+    /// tap), rotated.
+    #[test]
+    fn isi_aware_snr_reads_through_neighbour_taps_where_one_tap_is_capped() {
+        let rot = Complex32::from_polar(1.0, 0.7);
+        let taps = [rot * 0.08, rot, rot * 0.05];
+        for true_snr_db in [5.0f32, 15.0, 30.0] {
+            let sigma = 10f32.powf(-true_snr_db / 20.0);
+            let (rx, d) = isi_fixture(0xC0FFEE, 8192, taps, sigma);
+            let aware = isi_aware_snr_db_windowed(&rx, &d, 8).expect("windows fit");
+            assert!(
+                (aware - true_snr_db).abs() < 0.5,
+                "true {true_snr_db} dB through neighbour taps → ISI-aware read {aware:.2} dB"
+            );
+            if true_snr_db >= 30.0 {
+                let one_tap = additive_snr_db_windowed(&rx, &d, 8);
+                assert!(
+                    one_tap < true_snr_db - 6.0,
+                    "control: the one-tap estimate must be capped by the taps (read {one_tap:.1} dB \
+                     at true {true_snr_db}), or this fixture carries no interference to remove"
+                );
+            }
+        }
+    }
+
+    /// A run of constant decisions spans one tap, not three: the fit must decline rather than invent.
+    #[test]
+    fn isi_aware_snr_declines_when_no_window_spans_three_taps() {
+        let d = vec![Complex32::new(1.0, 0.0); 64];
+        let rx = d.clone();
+        assert_eq!(isi_aware_snr_db_windowed(&rx, &d, 8), None);
+        assert_eq!(
+            isi_aware_snr_db_windowed(&rx, &d, 3),
+            None,
+            "window ≤ taps is refused"
+        );
+    }
+
+    /// The frequency is recovered and removed: noiseless, a ramp of +0.3 or −0.2 rad/symbol comes back
+    /// within 1e-3, and the derotated stream then reads as noiseless to the ISI-aware estimate.
+    #[test]
+    fn residual_frequency_is_recovered_and_removed() {
+        for w in [0.3f32, -0.2, 0.0] {
+            let (clean, d) = isi_fixture(
+                7,
+                2048,
+                [
+                    Complex32::new(0.0, 0.0),
+                    Complex32::new(1.0, 0.0),
+                    Complex32::new(0.0, 0.0),
+                ],
+                0.0,
+            );
+            let mut rx: Vec<Complex32> = clean
+                .iter()
+                .enumerate()
+                .map(|(k, z)| z * Complex32::from_polar(1.0, w * k as f32))
+                .collect();
+            let got = remove_residual_frequency(&mut rx, &d);
+            assert!((got - w).abs() < 1e-3, "ramp {w} rad/sym → estimated {got}");
+            let after = isi_aware_snr_db_windowed(&rx, &d, 8).expect("windows fit");
+            assert!(
+                after > 50.0,
+                "ramp {w}: derotated stream reads {after:.1} dB, not noiseless"
+            );
+        }
+    }
+
+    /// The estimate must USE the decisions. On data whose neighbouring symbols mostly differ, the sum
+    /// of raw `rx_k·rx*_{k−1}` points the other way (ω + π): an estimator that stopped removing the
+    /// modulation would be wrong here deterministically, where on balanced random data it is only
+    /// wrong half the time — which is how a sabotage of the decision index passed the test above.
+    #[test]
+    fn residual_frequency_estimate_uses_the_decisions() {
+        let mut st = 0x5EEDu64;
+        let mut u = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let mut cur = 1.0f32;
+        let d: Vec<Complex32> = (0..2048)
+            .map(|_| {
+                if u() < 0.8 {
+                    cur = -cur;
+                }
+                Complex32::new(cur, 0.0)
+            })
+            .collect();
+        let w = 0.25f32;
+        let mut rx: Vec<Complex32> = d
+            .iter()
+            .enumerate()
+            .map(|(k, s)| s * Complex32::from_polar(1.0, w * k as f32))
+            .collect();
+        let got = remove_residual_frequency(&mut rx, &d);
+        assert!(
+            (got - w).abs() < 1e-3,
+            "flip-heavy data: ramp {w} → estimated {got}"
         );
     }
 
