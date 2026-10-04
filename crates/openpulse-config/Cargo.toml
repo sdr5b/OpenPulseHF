@@ -8,7 +8,7 @@ license.workspace = true
 serde            = { workspace = true }
 thiserror        = { workspace = true }
 toml             = { version = "0.8", default-features = false, features = ["parse", "display"] }
-dirs             = "5"
+dirs             = "7"
 ed25519-dalek    = { version = "2.0", features = ["rand_core"] }
 rand             = { workspace = true }
 tracing          = { workspace = true }
