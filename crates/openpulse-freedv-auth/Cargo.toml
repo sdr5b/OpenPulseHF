@@ -20,4 +20,4 @@ hex = "0.4"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rand.workspace = true
-ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
