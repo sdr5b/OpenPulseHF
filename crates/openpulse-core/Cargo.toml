@@ -27,4 +27,4 @@ zstd          = "0.13"
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 # Workspace-layering test reads every member manifest (tests/workspace_layering.rs).
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1.1", default-features = false, features = ["parse"] }
