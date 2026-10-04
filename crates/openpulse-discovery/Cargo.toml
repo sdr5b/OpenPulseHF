@@ -10,6 +10,6 @@ repository.workspace = true
 [dependencies]
 js8-plugin = { workspace = true }
 openpulse-core = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
