@@ -73,7 +73,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/openpulse-server  "dist/openpulse-server_${TAG}_linux_x86_64_static"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: x86-static
           path: dist/
@@ -126,7 +126,7 @@ jobs:
           find target/aarch64-unknown-linux-gnu/debian -name '*.deb' -exec cp {} dist/ \;
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aarch64-deb
           path: dist/
