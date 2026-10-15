@@ -50,7 +50,7 @@ jobs:
           shared-key: coverage
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-llvm-cov
 
